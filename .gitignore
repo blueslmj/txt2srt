@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# 输出文件
+*.srt
+
+# 音频文件（太大不适合git）
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.aac
+
+# 视频文件
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# 文本文件（用户数据）
+*.txt
+!requirements.txt
+!START_HERE.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.log
