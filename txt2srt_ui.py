@@ -183,7 +183,7 @@ def create_ui():
                 model_size = gr.Dropdown(
                     label="模型大小",
                     choices=["Tiny", "Base", "Small", "Medium", "Large"],
-                    value="Base",
+                    value="Small",
                     info="更大的模型更准确但更慢"
                 )
                 
@@ -198,7 +198,7 @@ def create_ui():
                     label="每行字数限制",
                     minimum=10,
                     maximum=80,
-                    value=30,
+                    value=40,
                     step=5,
                     info="控制每条字幕的最大字符数（推荐20-40字）"
                 )

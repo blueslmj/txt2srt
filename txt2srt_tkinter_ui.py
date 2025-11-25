@@ -25,9 +25,9 @@ class AudioTextAlignerUI:
         self.audio_path = tk.StringVar()
         self.text_path = tk.StringVar()
         self.output_path = tk.StringVar()
-        self.model_size = tk.StringVar(value="base")
+        self.model_size = tk.StringVar(value="small")
         self.language = tk.StringVar(value="zh")
-        self.max_chars = tk.IntVar(value=30)
+        self.max_chars = tk.IntVar(value=40)
         
         self.is_processing = False
         
