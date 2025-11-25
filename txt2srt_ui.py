@@ -11,7 +11,7 @@ import gradio as gr
 from txt2srt import align_audio_text, generate_srt, format_timestamp
 
 
-def process_audio_text(audio_file, text_input, text_file, model_size, language):
+def process_audio_text(audio_file, text_input, text_file, model_size, language, max_chars):
     """
     处理音频和文本，生成SRT字幕
     
@@ -21,6 +21,7 @@ def process_audio_text(audio_file, text_input, text_file, model_size, language):
         text_file: 上传的文本文件（可能是字符串路径或文件对象）
         model_size: Whisper模型大小
         language: 语言代码
+        max_chars: 每行最大字数
     
     Returns:
         (srt_file_path, preview_text, status_message)
@@ -58,6 +59,7 @@ def process_audio_text(audio_file, text_input, text_file, model_size, language):
         status += f"🎯 模型大小: {model_size}\n"
         status += f"🌏 语言: {language}\n"
         status += f"📝 文本长度: {len(text_content)} 字符\n"
+        status += f"📏 每行字数限制: {max_chars} 字\n"
         status += f"\n正在使用Whisper模型进行语音识别..."
         
         # 处理音频
@@ -66,7 +68,8 @@ def process_audio_text(audio_file, text_input, text_file, model_size, language):
             audio_path,
             text_content,
             model_name=model_size.lower(),
-            use_gpu=True  # 启用GPU加速
+            use_gpu=True,  # 启用GPU加速
+            max_chars=int(max_chars)  # 每行字数限制
         )
         
         # 生成SRT文件
@@ -191,6 +194,15 @@ def create_ui():
                     info="音频语言 (zh=中文, en=英文)"
                 )
                 
+                max_chars = gr.Slider(
+                    label="每行字数限制",
+                    minimum=10,
+                    maximum=80,
+                    value=30,
+                    step=5,
+                    info="控制每条字幕的最大字符数（推荐20-40字）"
+                )
+                
                 # 处理按钮
                 process_btn = gr.Button(
                     "🚀 开始处理",
@@ -256,7 +268,8 @@ def create_ui():
                 text_input,
                 text_file_input,
                 model_size,
-                language
+                language,
+                max_chars
             ],
             outputs=[
                 download_output,
@@ -273,7 +286,8 @@ def create_ui():
                     "这是一个示例文本。你可以输入你的文本内容。",  # text
                     None,  # text_file
                     "Base",  # model
-                    "zh"  # language
+                    "zh",  # language
+                    30  # max_chars
                 ]
             ],
             inputs=[
@@ -281,7 +295,8 @@ def create_ui():
                 text_input,
                 text_file_input,
                 model_size,
-                language
+                language,
+                max_chars
             ]
         )
     

@@ -26,18 +26,19 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
 
-def split_text_into_segments(text: str, max_chars: int = 50) -> List[str]:
+def split_text_into_segments(text: str, max_chars: int = 30) -> List[str]:
     """
     将长文本分割成适合字幕显示的短句
     
     优先级：
     1. 换行符（最高优先级，强制分句）
     2. 句子标点（。！？；等）
-    3. 长度限制（如果句子太长，强制分割）
+    3. 逗号等次要标点
+    4. 长度限制（如果句子太长，强制按字数分割）
     
     Args:
         text: 输入文本
-        max_chars: 每段最大字符数
+        max_chars: 每段最大字符数（默认30，适合视频字幕）
     
     Returns:
         分割后的文本段落列表
@@ -52,8 +53,8 @@ def split_text_into_segments(text: str, max_chars: int = 50) -> List[str]:
         if not line:
             continue
         
-        # 第二步：按标点符号分割每一行
-        sentences = re.split(r'([。！？；\.,!?;])', line)
+        # 第二步：按主要标点符号分割每一行（句号、问号、感叹号等）
+        sentences = re.split(r'([。！？；.!?;])', line)
         
         current_segment = ""
         
@@ -63,26 +64,123 @@ def split_text_into_segments(text: str, max_chars: int = 50) -> List[str]:
             
             if not sentence.strip():
                 continue
-                
-            potential_segment = current_segment + sentence + punct
+            
+            full_sentence = sentence + punct
+            potential_segment = current_segment + full_sentence
             
             # 如果累积的句子没超过长度限制，继续累积
             if len(potential_segment) <= max_chars:
                 current_segment = potential_segment
             else:
-                # 超过限制了，输出当前段落
+                # 先输出已累积的内容
                 if current_segment:
                     segments.append(current_segment.strip())
-                current_segment = sentence + punct
+                
+                # 处理当前句子（可能需要进一步分割）
+                if len(full_sentence) <= max_chars:
+                    current_segment = full_sentence
+                else:
+                    # 句子太长，需要进一步分割
+                    sub_segments = _split_long_sentence(full_sentence, max_chars)
+                    # 把前面的都加入segments，最后一个作为current_segment继续累积
+                    for sub in sub_segments[:-1]:
+                        segments.append(sub.strip())
+                    current_segment = sub_segments[-1] if sub_segments else ""
         
-        # 每一行结束后，强制输出累积的内容（重要！）
+        # 每一行结束后，强制输出累积的内容
         if current_segment.strip():
             segments.append(current_segment.strip())
     
     return segments
 
 
-def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_gpu: bool = True) -> List[Dict]:
+def _split_long_sentence(sentence: str, max_chars: int) -> List[str]:
+    """
+    分割超长句子
+    
+    优先级：
+    1. 按逗号分割
+    2. 强制按字数分割
+    
+    Args:
+        sentence: 需要分割的长句
+        max_chars: 每段最大字符数
+    
+    Returns:
+        分割后的句子列表
+    """
+    if len(sentence) <= max_chars:
+        return [sentence]
+    
+    segments = []
+    
+    # 尝试按逗号分割
+    parts = re.split(r'([，,、])', sentence)
+    
+    current = ""
+    for i in range(0, len(parts), 2):
+        part = parts[i]
+        comma = parts[i + 1] if i + 1 < len(parts) else ""
+        
+        if not part.strip():
+            continue
+        
+        full_part = part + comma
+        potential = current + full_part
+        
+        if len(potential) <= max_chars:
+            current = potential
+        else:
+            if current:
+                segments.append(current.strip())
+            
+            # 如果单个部分仍然太长，强制按字数分割
+            if len(full_part) > max_chars:
+                force_split = _force_split_by_chars(full_part, max_chars)
+                segments.extend(force_split[:-1])
+                current = force_split[-1] if force_split else ""
+            else:
+                current = full_part
+    
+    if current.strip():
+        segments.append(current.strip())
+    
+    return segments if segments else [sentence]
+
+
+def _force_split_by_chars(text: str, max_chars: int) -> List[str]:
+    """
+    强制按字数分割文本
+    
+    Args:
+        text: 要分割的文本
+        max_chars: 每段最大字符数
+    
+    Returns:
+        分割后的文本列表
+    """
+    segments = []
+    
+    while len(text) > max_chars:
+        # 尽量在标点处分割
+        split_pos = max_chars
+        
+        # 向前查找标点或空格
+        for i in range(max_chars - 1, max(0, max_chars - 10), -1):
+            if text[i] in '，,、 　':
+                split_pos = i + 1
+                break
+        
+        segments.append(text[:split_pos].strip())
+        text = text[split_pos:].strip()
+    
+    if text:
+        segments.append(text)
+    
+    return segments
+
+
+def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_gpu: bool = True, max_chars: int = 30) -> List[Dict]:
     """
     先用Whisper识别获取准确的时间戳，然后用用户文本替换识别文本
     
@@ -145,8 +243,8 @@ def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_g
             print(f"   [{i+1}] {seg['start']:.1f}s - {seg['end']:.1f}s: {seg['text'][:30]}...")
     
     print("\n🎯 步骤2: 将用户文本分割成句子...")
-    user_sentences = split_text_into_segments(text)
-    print(f"   用户文本有 {len(user_sentences)} 个句子")
+    user_sentences = split_text_into_segments(text, max_chars=max_chars)
+    print(f"   用户文本有 {len(user_sentences)} 个句子（每行限制 {max_chars} 字）")
     
     # 显示前几个用户句子
     if len(user_sentences) > 0:

@@ -27,6 +27,7 @@ class AudioTextAlignerUI:
         self.output_path = tk.StringVar()
         self.model_size = tk.StringVar(value="base")
         self.language = tk.StringVar(value="zh")
+        self.max_chars = tk.IntVar(value=30)
         
         self.is_processing = False
         
@@ -122,6 +123,27 @@ class AudioTextAlignerUI:
             row=1, column=2, sticky=tk.W, padx=5, pady=5
         )
         
+        # 每行字数限制
+        ttk.Label(settings_frame, text="每行字数:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        chars_frame = ttk.Frame(settings_frame)
+        chars_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        
+        self.chars_scale = ttk.Scale(
+            chars_frame,
+            from_=10,
+            to=80,
+            variable=self.max_chars,
+            orient=tk.HORIZONTAL,
+            length=150,
+            command=self.update_chars_label
+        )
+        self.chars_scale.pack(side=tk.LEFT)
+        
+        self.chars_label = ttk.Label(chars_frame, text="30 字", width=8)
+        self.chars_label.pack(side=tk.LEFT, padx=10)
+        
+        ttk.Label(chars_frame, text="(推荐20-40字)").pack(side=tk.LEFT)
+        
         # === 处理按钮 ===
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=5, column=0, columnspan=3, pady=15)
@@ -216,6 +238,10 @@ class AudioTextAlignerUI:
         if filename:
             self.output_path.set(filename)
             
+    def update_chars_label(self, value):
+        """更新字数标签"""
+        self.chars_label.config(text=f"{int(float(value))} 字")
+    
     def clear_all(self):
         """清空所有输入"""
         self.audio_path.set("")
@@ -260,6 +286,7 @@ class AudioTextAlignerUI:
             self.log(f"📝 文本文件: {os.path.basename(self.text_path.get())}")
             self.log(f"🎯 模型大小: {self.model_size.get()}")
             self.log(f"🌏 语言: {self.language.get()}")
+            self.log(f"📏 每行字数: {self.max_chars.get()} 字")
             self.log("")
             
             # 读取文本
@@ -277,7 +304,8 @@ class AudioTextAlignerUI:
             segments = align_audio_text(
                 self.audio_path.get(),
                 text_content,
-                model_name=self.model_size.get()
+                model_name=self.model_size.get(),
+                max_chars=self.max_chars.get()
             )
             
             self.log(f"✅ 语音识别完成！识别到 {len(segments)} 个段落")
