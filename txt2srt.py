@@ -741,11 +741,21 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
     segments = sorted(segments, key=lambda x: x["start"])
     
     fixed_segments = []
+    duration_fixed = 0  # 记录修复了多少个超长时长
     
     for i, segment in enumerate(segments):
         start = segment["start"]
         end = segment["end"]
         text = segment["text"]
+        
+        # 计算文本的有效字符数（用于估算合理时长）
+        text_chars = len([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
+        
+        # 计算合理的最大时长（每个字最多0.4秒，加上1秒基础时间，最少2秒）
+        max_duration = max(2.0, 1.0 + text_chars * 0.4)
+        
+        # 计算合理的最小时长（每个字至少0.12秒，加上0.5秒基础时间）
+        min_duration = max(0.8, 0.5 + text_chars * 0.12)
         
         # 如果不是第一个段落，确保开始时间不早于上一个段落的结束时间
         if i > 0:
@@ -753,12 +763,18 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
             if start < prev_end:
                 # 重叠了，调整开始时间为上一个段落结束时间
                 start = prev_end
-                # 如果调整后结束时间也变得不合理，重新计算
-                if end <= start:
-                    # 根据文本长度估算合理的时长（每个字约0.15秒）
-                    text_chars = len([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-                    estimated_duration = max(1.0, text_chars * 0.15)
-                    end = start + estimated_duration
+        
+        # 检查时长是否合理
+        duration = end - start
+        
+        # 修复超长时长（防止"吞字"问题）
+        if duration > max_duration:
+            end = start + max_duration
+            duration_fixed += 1
+        
+        # 修复过短时长
+        if duration < min_duration:
+            end = start + min_duration
         
         # 给结束时间添加0.3秒的缓冲（让字幕多停留一会儿，便于阅读）
         end = end + 0.3
@@ -772,7 +788,6 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
         
         # 确保结束时间晚于开始时间
         if end <= start:
-            text_chars = len([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
             estimated_duration = max(1.0, text_chars * 0.15)
             end = start + estimated_duration
         
@@ -795,6 +810,8 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
     overlaps_fixed = sum(1 for i in range(len(segments)) if i > 0 and segments[i]["start"] < segments[i-1]["end"])
     if overlaps_fixed > 0:
         print(f"   修复了 {overlaps_fixed} 处时间重叠")
+    if duration_fixed > 0:
+        print(f"   修复了 {duration_fixed} 处超长时长（防止吞字）")
     
     print(f"   为每个字幕添加了 0.3秒 的阅读缓冲时间")
     
