@@ -751,16 +751,25 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
         # 计算文本的有效字符数（用于估算合理时长）
         text_chars = len([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
         
-        # 计算合理的最大时长（每个字最多0.4秒，加上1秒基础时间，最少2秒）
-        max_duration = max(2.0, 1.0 + text_chars * 0.4)
+        # 计算合理的最大时长（每个字最多0.25秒，加上1秒基础时间）
+        # 中文语速约3-4字/秒，0.25秒/字已经是较慢的语速
+        max_duration = max(3.0, 1.0 + text_chars * 0.25)
         
-        # 计算合理的最小时长（每个字至少0.12秒，加上0.5秒基础时间）
-        min_duration = max(0.8, 0.5 + text_chars * 0.12)
+        # 计算合理的最小时长（每个字至少0.15秒，加上0.5秒基础时间）
+        min_duration = max(1.0, 0.5 + text_chars * 0.15)
         
-        # 如果不是第一个段落，确保开始时间不早于上一个段落的结束时间
+        # 如果不是第一个段落，检查与前一个字幕的关系
         if i > 0:
             prev_end = fixed_segments[-1]["end"]
-            if start < prev_end:
+            
+            # 检查是否有时间间隙（超过2秒的间隙说明可能有内容被"吞"了）
+            gap = start - prev_end
+            if gap > 2.0:
+                # 有较大间隙，将当前字幕开始时间调整为前一个字幕结束时间
+                # 这样可以填补被"吞掉"的时间
+                print(f"   ⚠️ 检测到 {gap:.1f}秒 时间间隙，自动填补")
+                start = prev_end
+            elif start < prev_end:
                 # 重叠了，调整开始时间为上一个段落结束时间
                 start = prev_end
         
