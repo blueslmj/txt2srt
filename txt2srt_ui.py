@@ -6,7 +6,16 @@
 """
 
 import os
+import sys
 import tempfile
+import socket
+
+# 修复 Windows 终端中文乱码问题
+if sys.platform == "win32":
+    os.system("chcp 65001 > nul 2>&1")
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
 import gradio as gr
 from txt2srt import align_audio_text, generate_srt, format_timestamp
 
@@ -317,9 +326,9 @@ def main():
     app = create_ui()
     
     # 启动应用
+    # Gradio会自动寻找可用端口（从7860开始）
     app.launch(
         server_name="127.0.0.1",
-        server_port=7860,
         share=False,
         inbrowser=True,  # 自动打开浏览器
         show_error=True,

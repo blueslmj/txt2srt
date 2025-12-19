@@ -217,12 +217,14 @@ def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_g
     print("🎯 步骤1: 使用Whisper识别音频，获取准确的时间戳...")
     
     # 使用stable-ts识别音频（获取精确的句子级时间戳）
+    # fp16=True 启用半精度推理，在支持的GPU上可显著提升性能
     result = model.transcribe(
         audio_path,
         language="zh",
         word_timestamps=True,
         verbose=False,
         regroup=True,  # 重新分组，获得合理的句子切分
+        fp16=(device == "cuda"),  # GPU时启用FP16加速
     )
     
     # 提取识别出的句子和时间戳
