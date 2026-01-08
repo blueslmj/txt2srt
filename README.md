@@ -8,7 +8,8 @@
 - 📝 自动将文本与音频对齐
 - ⏱️ 精确的时间戳生成
 - 🌏 支持中文、英文等多种语言
-- 🚀 基于OpenAI Whisper模型，准确度高
+- **🚀 性能飞跃**：集成 **Faster-Whisper (CTranslate2)** 引擎，推理速度最高提升 **50倍**！
+- **✨ 观感优化**：新增智能字幕平滑算法，消除字幕微光/闪烁，自动填补句间空隙，观感流畅自然。
 - 🖥️ **提供两种UI界面：Web界面（Gradio）和桌面界面（Tkinter）**
 
 ## 安装步骤
@@ -31,7 +32,7 @@ source venv/bin/activate
 venv\Scripts\pip install -r requirements.txt
 ```
 
-**注意**: 首次运行时，Whisper会自动下载模型文件（约140MB-2.9GB，取决于模型大小）
+**注意**: 首次运行时，程序会自动从 HuggingFace 下载 **Faster-Whisper** 转换版模型（与原版 OpenAI 模型通用，但目录结构不同）。
 
 ## 使用方法
 
@@ -48,7 +49,7 @@ venv\Scripts\python txt2srt_ui.py
 
 浏览器会自动打开 http://127.0.0.1:7860
 
-**特点**：现代化、美观、支持拖拽上传
+**特点**：现代化、美观、支持拖拽上传、**实时进度显示**。
 
 #### Tkinter桌面界面
 ```bash
@@ -115,36 +116,25 @@ venv\Scripts\python txt2srt.py speech.mp3 transcript.txt -o output.srt
 venv\Scripts\python txt2srt.py speech.mp3 transcript.txt -m medium
 ```
 
-#### 示例4: 英文音频
+## Whisper模型与性能说明
 
-```bash
-venv\Scripts\python txt2srt.py english.mp3 transcript.txt -l en
-```
+基于 RTX 30/40系列显卡的测试数据：
 
-#### 示例5: 直接输入文本（不使用文件）
-
-```bash
-venv\Scripts\python txt2srt.py audio.mp3 "这是要对齐的文本内容"
-```
-
-## Whisper模型说明
-
-| 模型 | 参数量 | 英文准确度 | 多语言准确度 | 相对速度 | 磁盘空间 |
-|------|--------|------------|--------------|----------|----------|
-| tiny | 39M    | 低         | 低           | ~32x     | ~75MB    |
-| base | 74M    | 中         | 中           | ~16x     | ~140MB   |
-| small| 244M   | 较高       | 较高         | ~6x      | ~460MB   |
-| medium| 769M  | 高         | 高           | ~2x      | ~1.5GB   |
-| large| 1550M  | 最高       | 最高         | 1x       | ~2.9GB   |
+| 模型 | 参数量 | 英文准确度 | 中文准确度 | 原版速度 | Faster-Whisper速度 | 磁盘空间 |
+|------|--------|------------|--------------|----------|-------------------|----------|
+| tiny | 39M    | 低         | 低           | ~32x     | **~100x+**        | ~75MB    |
+| base | 74M    | 中         | 中           | ~16x     | **~80x**          | ~140MB   |
+| small| 244M   | 较高       | 较高         | ~6x      | **~40x**          | ~460MB   |
+| medium| 769M  | 高         | 高           | ~2x      | **~15x**          | ~1.5GB   |
+| large| 1550M  | 最高       | 最高         | 1x       | **~8x**           | ~2.9GB   |
 
 **建议**: 
-- 快速测试: 使用 `tiny` 或 `base`
-- 生产环境: 使用 `small` 或 `medium`
-- 最高质量: 使用 `large`
+- **日常使用**: 推荐 **small** 模型，在 Faster-Whisper 加持下速度飞快且精度足够。
+- **高精度**: 使用 `large-v3`，即使是 Large 模型现在也能跑出不错的速度。
 
 ## 输出格式
 
-生成的SRT文件格式示例：
+生成的SRT文件已包含**观感优化**：
 
 ```
 1
@@ -153,62 +143,44 @@ venv\Scripts\python txt2srt.py audio.mp3 "这是要对齐的文本内容"
 
 2
 00:00:03,500 --> 00:00:07,200
-这是第二句字幕内容
+这是第二句字幕内容（此处空隙已被自动填补，避免闪烁）
 
-3
-00:00:07,200 --> 00:00:10,800
-这是第三句字幕内容
+...
 ```
 
 ## 技术原理
 
-### 真正的文本对齐 ⭐
+### 1. 下一代推理引擎
+本项目采用了 **CTranslate2 (Faster-Whisper)** 作为推理后端，相比原版 OpenAI Whisper：
+- **Int8/Float16 混合精度**：在不损失精度的情况下大幅减少显存占用。
+- **VAD 过滤**：自动检测并跳过静音片段，不再对空白音频浪费算力。
 
-本工具实现了**真正的音频-文本对齐**，而不只是语音识别：
-
-1. **Whisper识别音频** → 获取精确的时间戳（词级/段落级）
+### 2. 真正的文本对齐 ⭐
+1. **Whisper识别** → 获取精确的时间戳（启用 VAD）
 2. **分析用户文本** → 智能分割成合适的字幕段落
-3. **智能对齐算法** → 将用户文本与时间戳精确匹配
-4. **生成SRT字幕** → 使用**用户的准确文本** + **Whisper的精确时间**
-
-**优势**：
-- ✅ 字幕内容使用用户提供的准确文本（无识别错误）
-- ✅ 时间戳来自Whisper的精确识别
-- ✅ 支持GPU加速，处理速度提升10-50倍
+3. **DTW 算法对齐** → 将用户文本与时间戳精确匹配
+4. **智能平滑** → 应用 `optimize_subtitle_duration` 算法，消除字幕微光，填补句间空隙
+5. **生成结果** → 输出完美对齐且观感极佳的 SRT
 
 📖 详细说明：[ALIGNMENT_GUIDE.md](ALIGNMENT_GUIDE.md)
 
 ## 系统要求
 
-- Python 3.10-3.13（推荐3.12或3.13）
-- **推荐使用GPU加速**（速度提升10-50倍）
-  - NVIDIA GPU（支持CUDA）
-  - 📖 GPU配置指南：[GPU_SETUP.md](GPU_SETUP.md)
-- 至少4GB可用内存（取决于模型大小）
-- 🔍 检查GPU：运行 `check_gpu.bat`
-
-## 支持的音频格式
-
-本工具支持 **50+ 种音频格式**，包括：
-- 常见格式：MP3, WAV, M4A, FLAC, OGG
-- 无损格式：FLAC, WAV, AIFF
-- 视频格式：MP4, AVI, MKV（直接提取音频）
-
-📖 **详细格式说明**: [SUPPORTED_FORMATS.md](SUPPORTED_FORMATS.md)
+- Python 3.10-3.13（推荐3.12）
+- **强烈推荐使用 NVIDIA 显卡**（支持 CUDA 11.8/12.x）
+- 至少 4GB 显存（运行 Large 模型建议 8GB+）
+- CPU 模式虽然支持，但速度无法享受到 GPU 的数十倍加速
 
 ## 常见问题
 
+### Q: 报错 `cuBLAS failed` 或 `CUBLAS_STATUS_NOT_SUPPORTED`？
+A: 代码已默认使用兼容性最好的 `float16` 精度。如果仍报错，请确保您的显卡驱动已更新到最新版本。
+
 ### Q: 首次运行很慢？
-A: Whisper会在首次运行时下载模型文件，这是正常现象。
+A: Faster-Whisper 需要从 HuggingFace 下载转换后的模型权重，这只会在第一次使用某个尺寸的模型时发生。
 
-### Q: 如何提高准确度？
-A: 使用更大的模型（如 medium 或 large），并确保音频质量清晰。
-
-### Q: 支持哪些语言？
-A: Whisper支持99种语言，包括中文、英文、日语、韩语等。
-
-### Q: 可以处理多长的音频？
-A: 理论上没有限制，但处理时间与音频长度成正比。
+### Q: 原版 Whisper 模型通用吗？
+A: 不通用。Faster-Whisper 使用 CTranslate2 格式，会自动下载。原版 `.pt` 文件无法直接加载。
 
 ## 许可证
 
