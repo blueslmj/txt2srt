@@ -209,22 +209,28 @@ def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_g
     else:
         print(f"✅ 使用设备: {device.upper()}")
     
-    print(f"加载Whisper模型 (stable-ts增强版): {model_name}...")
-    # 使用stable-ts加载模型（提供更精确的时间戳）
-    model = stable_whisper.load_model(model_name, device=device)
+    print(f"加载Whisper模型 (Faster-Whisper增强版): {model_name}...")
+    # 使用stable-ts加载faster-whisper模型
+    # ⚠️ 修复 cuBLAS 错误: 回退到 float16，int8_float16 在部分环境会导致 CUBLAS_STATUS_NOT_SUPPORTED
+    compute_type = "float16" if device == "cuda" else "int8"
+    print(f"   - 计算精度: {compute_type} (兼容性模式)")
+    
+    model = stable_whisper.load_faster_whisper(model_name, device=device, compute_type=compute_type)
     
     print(f"正在处理音频文件: {audio_path}")
-    print("🎯 步骤1: 使用Whisper识别音频，获取准确的时间戳...")
+    print("🎯 步骤1: 使用Faster-Whisper识别音频，获取准确的时间戳...")
     
     # 使用stable-ts识别音频（获取精确的句子级时间戳）
-    # fp16=True 启用半精度推理，在支持的GPU上可显著提升性能
     result = model.transcribe(
         audio_path,
         language="zh",
         word_timestamps=True,
         verbose=False,
-        regroup=True,  # 重新分组，获得合理的句子切分
-        fp16=(device == "cuda"),  # GPU时启用FP16加速
+        regroup=True,     # 重新分组，获得合理的句子切分
+        beam_size=1,      # 强制使用 Greedy Loading，大幅进一步提速
+        temperature=0,    # 确定性输出
+        vad_filter=True,  # ⚡️ 性能优化核心 2: 开启 VAD (语音活动检测)，跳过静音片段
+        vad_parameters=dict(min_silence_duration_ms=500), # 只有超过500ms的静音才跳过
     )
     
     # 提取识别出的句子和时间戳
@@ -262,10 +268,13 @@ def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_g
         user_sentences
     )
     
-    print(f"\n🎯 步骤4: 修复时间戳重叠问题...")
+    print(f"\n🎯 步骤4: 修复时间戳重叠与微调字幕体验...")
     
     # 修复重叠的时间戳，确保严格按时间顺序
     aligned_segments = fix_overlapping_timestamps(aligned_segments)
+    
+    # 进一步优化字幕持续时间（消除闪烁感，填补小空隙）
+    aligned_segments = optimize_subtitle_duration(aligned_segments)
     
     print(f"\n✅ 对齐完成！生成了 {len(aligned_segments)} 个字幕段落")
     print(f"   保留了Whisper的准确时间戳，使用了用户的正确文本")
@@ -764,14 +773,8 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
         if i > 0:
             prev_end = fixed_segments[-1]["end"]
             
-            # 检查是否有时间间隙（超过2秒的间隙说明可能有内容被"吞"了）
-            gap = start - prev_end
-            if gap > 2.0:
-                # 有较大间隙，将当前字幕开始时间调整为前一个字幕结束时间
-                # 这样可以填补被"吞掉"的时间
-                print(f"   ⚠️ 检测到 {gap:.1f}秒 时间间隙，自动填补")
-                start = prev_end
-            elif start < prev_end:
+            # 仅处理重叠，不在此处做大范围的空隙填补
+            if start < prev_end:
                 # 重叠了，调整开始时间为上一个段落结束时间
                 start = prev_end
         
@@ -787,43 +790,64 @@ def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
         if duration < min_duration:
             end = start + min_duration
         
-        # 给结束时间添加0.3秒的缓冲（让字幕多停留一会儿，便于阅读）
-        end = end + 0.3
-        
-        # 如果有下一个字幕，确保不超过下一个字幕的开始时间
-        if i + 1 < len(segments):
-            next_start = segments[i + 1]["start"]
-            if end > next_start:
-                # 缩短到下一个字幕开始前0.05秒（留一点间隙）
-                end = max(start + 0.5, next_start - 0.05)
-        
         # 确保结束时间晚于开始时间
         if end <= start:
+            # 此时start可能被推迟了，end保持原样可能导致end<=start
+            # 强制给一个最短持续时间
             estimated_duration = max(1.0, text_chars * 0.15)
             end = start + estimated_duration
         
-        # 确保最小显示时间（至少0.5秒）
-        if end - start < 0.5:
-            end = start + 0.5
-            # 再次检查是否与下一个字幕冲突
-            if i + 1 < len(segments):
-                next_start = segments[i + 1]["start"]
-                if end > next_start:
-                    end = max(start + 0.5, next_start - 0.05)
+        # 再次检查是否与下一个字幕冲突（确保基础的无重叠）
+        if i + 1 < len(segments):
+            next_start = segments[i + 1]["start"]
+            if end > next_start:
+                # 缩短到下一个字幕开始前（严格不重叠）
+                end = next_start
         
+        # 最终安全检查：如果修正后end还是<=start，强制0.5秒
+        if end <= start:
+             end = start + 0.5 
+
         fixed_segments.append({
             "start": start,
             "end": end,
             "text": text
         })
     
-    # 显示修复统计
-    overlaps_fixed = sum(1 for i in range(len(segments)) if i > 0 and segments[i]["start"] < segments[i-1]["end"])
-    if overlaps_fixed > 0:
-        print(f"   修复了 {overlaps_fixed} 处时间重叠")
     if duration_fixed > 0:
-        print(f"   修复了 {duration_fixed} 处超长时长（防止吞字）")
-    
-    print(f"   为每个字幕添加了 0.3秒 的阅读缓冲时间")
+        print(f"   (基础修正) 修复了 {duration_fixed} 处超长时长")
     
     return fixed_segments
+
+
+def optimize_subtitle_duration(segments: List[Dict], max_extension: float = 0.5) -> List[Dict]:
+    """
+    优化字幕持续时间：填补句间空隙，提升观感
+    args:
+        segments: 包含 {"start": float, "end": float, "text": str} 的列表
+        max_extension: 最大自动延长时间（秒），建议 0.5
+    """
+    if not segments:
+        return segments
+
+    # 遍历（除了最后一句）
+    for i in range(len(segments) - 1):
+        curr_seg = segments[i]
+        next_seg = segments[i+1]
+        
+        # 计算两句之间的空隙
+        gap = next_seg["start"] - curr_seg["end"]
+        
+        if gap > 0:
+            # 策略：填补空隙，但保留 0.1s 间隔，且不超过最大延长阈值
+            extend_by = min(max_extension, gap - 0.1)
+            
+            # 只有当确实能延长时才操作 (extend_by可能为负，如果gap<0.1)
+            if extend_by > 0:
+                curr_seg["end"] += extend_by
+                
+    # 特殊处理最后一句：总是延长 0.5s，防止结束太快
+    if segments:
+        segments[-1]["end"] += 0.5
+    
+    return segments
