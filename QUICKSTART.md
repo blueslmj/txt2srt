@@ -4,38 +4,30 @@
 
 ## 📥 第一步：安装
 
-### ⚠️ 检查 Python 版本（重要！）
-
-**系统要求**：Python 3.10-3.13
-
-```bash
-# 检查版本
-python --version
-
-# 或使用版本检查工具
-PYTHON_VERSION_CHECK.bat
-```
-
-**推荐版本**：
-- ✅ Python 3.12（推荐）
-- ✅ Python 3.13（推荐）
-- ⚠️ Python 3.11, 3.10（可用）
-- ❌ Python 3.14（暂不支持）
-
-**如果版本不对**：请查看 [INSTALL_FIX.md](INSTALL_FIX.md)
-
 ### 双击运行安装脚本
 ```bash
 setup.bat
 ```
 
 这个脚本会自动：
-1. ✅ 检查Python版本
-2. ✅ 创建Python虚拟环境
-3. ✅ 安装所有必要的依赖包
-4. ✅ 配置好运行环境
+1. ✅ 安装或定位 Python 3.12
+2. ✅ 检测 NVIDIA / CPU 硬件模式
+3. ✅ 创建或修复 Python 虚拟环境
+4. ✅ 安装匹配的 CUDA/CPU PyTorch 和项目依赖
+5. ✅ 验证依赖、GPU 与运行库
+6. ✅ 将依赖、模型和临时文件全部保存在项目目录
 
-**等待时间**：首次安装大约需要3-5分钟
+默认使用 `auto` profile。AMD、Intel 或无独显电脑会自动安装 CPU 版；RTX 50 系列会使用 CUDA 13，其他受支持 NVIDIA 显卡使用 CUDA 12.6。
+
+如需强制 CPU：
+
+```bash
+setup.bat cpu
+```
+
+**等待时间**：CPU 安装通常较快；CUDA 安装需要下载约 2GB 的 PyTorch，取决于网络速度。
+
+本项目不使用用户级 pip、Hugging Face 或 Whisper 缓存：依赖安装在 `venv`，模型下载到 `models`，临时文件写入 `.runtime`。关闭程序后可以直接删除这些目录；再次运行 `setup.bat` 或使用模型时会重新创建。
 
 ---
 
@@ -104,8 +96,9 @@ setup.bat
 
 2. **设置参数** ⚙️
    ```
-   模型大小：base（快速）或 small/medium（更准确）
+   模型大小：small（推荐）或 base（更快）/medium（更准确）
    语言：zh（中文）或 en（英文）
+   运行设备：auto（自动选择）或 cuda/cpu
    ```
 
 3. **点击"开始处理"** 🚀
@@ -175,7 +168,7 @@ setup.bat
 | 15-30分钟 | Medium | 15-30分钟 | 专业制作 |
 
 **提示**：
-- 首次运行会下载模型（约140MB-1.5GB）
+- 首次运行会把模型下载到项目 `models`（约140MB-1.5GB）
 - 后续运行不需要重新下载
 - 使用GPU会大幅提升速度
 
@@ -184,7 +177,7 @@ setup.bat
 ## ❓ 常见问题
 
 ### Q1: 首次启动很慢？
-**A**: 正常现象，Whisper会下载模型文件（约140MB-2.9GB）。只需下载一次。
+**A**: 正常现象，Whisper会把模型文件下载到项目 `models`（约140MB-2.9GB）。只需下载一次。
 
 ### Q2: 如何提高准确度？
 **A**: 使用更大的模型（Small或Medium），确保音频质量清晰。

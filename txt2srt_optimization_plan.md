@@ -17,7 +17,7 @@
 #### A. 环境依赖
 确保安装了 `faster-whisper` 以及 `stable-ts`（推荐使用 `stable-ts` 作为上层封装，它对 `faster-whisper` 提供了良好的兼容性）。
 ```bash
-pip install faster-whisper stable-ts
+pip install --no-cache-dir faster-whisper stable-ts
 ```
 *注：Windows 用户需要确保已安装 CUDA Toolkit (推荐 11.8 或 12.x) 和 cuDNN。*
 

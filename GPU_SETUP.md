@@ -1,234 +1,98 @@
-# 🚀 GPU 加速设置指南
+# GPU 与硬件安装指南
 
-## 为什么需要 GPU？
+本项目在 Windows 上使用 `setup.bat` 调用 `install.ps1`，根据硬件选择匹配的运行环境。不要把一台电脑生成的 `venv` 复制到另一台电脑。
 
-使用 **GPU 加速**可以让 Whisper 模型运行速度提升 **10-50倍**！
+安装器禁用用户级 pip 缓存，Python 依赖安装在 `venv`；模型固定下载到 `models`；安装及运行临时文件写入 `.runtime`。关闭程序后可直接删除这三个项目内目录进行彻底清理。Python、NVIDIA 驱动和 CUDA Toolkit 是系统组件，不包含在其中。
 
-| 处理方式 | 5分钟音频 | 30分钟音频 |
-|---------|----------|-----------|
-| CPU | 5-10分钟 | 30-60分钟 |
-| GPU | 10-30秒 | 2-5分钟 |
+## 推荐用法
 
----
-
-## ✅ 检查 GPU 是否可用
-
-运行这个命令检查：
-
-```bash
-# 激活虚拟环境
-venv\Scripts\activate
-
-# 检查GPU
-python -c "import torch; print(f'GPU可用: {torch.cuda.is_available()}'); print(f'GPU名称: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"无\"}'); print(f'CUDA版本: {torch.version.cuda}')"
+```powershell
+setup.bat
 ```
 
-**输出示例**：
-```
-GPU可用: True
-GPU名称: NVIDIA GeForce RTX 3060
-CUDA版本: 11.8
-```
+自动检测只负责选择安装 profile；程序运行时的“自动选择”还会再次调用 `torch.cuda.is_available()`。如果 CUDA 不可用，应用会回退到 CPU。
 
-如果显示 `GPU可用: False`，说明需要安装 GPU 支持。
+## Profile 对照
 
----
+| Profile | 适用硬件 | PyTorch 构建 |
+| --- | --- | --- |
+| `auto` | 所有用户 | 自动选择下列模式 |
+| `nvidia-modern` | RTX 50 / Blackwell，计算能力 12.x | Torch 2.11.0 + cu130 |
+| `nvidia-legacy` | Maxwell、Pascal、Volta、Turing、Ampere、Ada 等计算能力 5.x–11.x | Torch 2.11.0 + cu126 |
+| `cpu` | AMD/Intel 显卡、无独显、CUDA 排障 | Torch 2.11.0 CPU |
 
-## 🔧 安装 GPU 支持（Windows + NVIDIA 显卡）
+手动指定示例：
 
-### 第1步：检查显卡
-
-**支持的显卡**：NVIDIA GPU（需要支持CUDA）
-- ✅ GeForce 系列（GTX 1000+, RTX 系列）
-- ✅ Quadro 系列
-- ✅ Tesla 系列
-
-**不支持**：
-- ❌ AMD GPU（目前PyTorch主要支持NVIDIA CUDA）
-- ❌ Intel 集成显卡
-
-### 第2步：安装 NVIDIA 驱动
-
-1. 访问 NVIDIA 官网：https://www.nvidia.com/Download/index.aspx
-2. 下载并安装最新驱动
-3. 重启电脑
-
-### 第3步：检查 CUDA 版本
-
-```bash
-# 运行命令
-nvidia-smi
+```powershell
+setup.bat nvidia-modern
+setup.bat nvidia-legacy
+setup.bat cpu
 ```
 
-查看 "CUDA Version" 一栏，记住版本号（如 12.1, 11.8 等）
+## RTX 50 / Blackwell 特别说明
 
-### 第4步：安装 PyTorch GPU 版本
+RTX 50 使用 CUDA 13 PyTorch，但 Faster-Whisper 的 CTranslate2 Windows wheel 仍需要 CUDA 12.x 的 cuBLAS。安装器会检查 `cublas64_12.dll`：
 
-#### 方式A：自动安装（推荐）
+- 已安装 CUDA Toolkit 12.x：直接复用。
+- 未安装：交互模式会询问是否通过 winget 安装 CUDA Toolkit 12.8。
+- 拒绝安装或非交互模式未授权：自动回退 CPU。
 
-访问 PyTorch 官网选择器：https://pytorch.org/get-started/locally/
+非交互安装并允许安装 Toolkit：
 
-选择：
-- PyTorch Build: Stable
-- Your OS: Windows
-- Package: Pip
-- Language: Python
-- Compute Platform: CUDA 11.8 或 12.1（根据你的版本）
-
-会得到安装命令，例如：
-
-```bash
-# 激活虚拟环境
-venv\Scripts\activate
-
-# 卸载CPU版本
-pip uninstall torch torchvision torchaudio
-
-# 安装GPU版本（CUDA 11.8）
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# 或安装GPU版本（CUDA 12.1）
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 `
+  -Profile auto -NonInteractive -InstallCudaToolkit
 ```
 
-#### 方式B：手动安装
+## AMD 与 Intel 显卡
 
-```bash
-# 激活虚拟环境
-venv\Scripts\activate
+当前 Windows 版本的 Faster-Whisper/CTranslate2 预编译 GPU 后端面向 NVIDIA CUDA：
 
-# 卸载现有版本
-pip uninstall torch torchvision torchaudio -y
+- AMD/Intel Windows 用户使用 CPU profile。
+- AMD Linux ROCm、Intel XPU 需要额外后端适配，当前项目没有开箱即用支持。
+- CPU 模式推荐 `tiny`、`base` 或 `small` 模型。
 
-# 安装 CUDA 11.8 版本
-pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+## 检测与验证
 
-# 或安装 CUDA 12.1 版本
-pip install torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+只查看将要选择的 profile：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -DryRun -NonInteractive
 ```
 
-### 第5步：验证安装
+查看安装记录：
 
-```bash
-# 测试GPU
-python -c "import torch; print(f'✅ GPU可用!' if torch.cuda.is_available() else '❌ GPU不可用'); print(f'GPU: {torch.cuda.get_device_name(0)}' if torch.cuda.is_available() else 'CPU模式')"
+```powershell
+Get-Content venv\hardware-profile.json
 ```
 
----
+手动验证：
 
-## 🎯 使用 GPU 加速
-
-安装完成后，程序会**自动使用GPU**！
-
-启动UI时会看到：
-```
-✅ 使用设备: GPU
-GPU名称: NVIDIA GeForce RTX 3060
+```powershell
+venv\Scripts\python -m pip check
+venv\Scripts\python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
-如果看到：
+## 常见问题
+
+### 安装了 NVIDIA profile，但 CUDA 不可用
+
+1. 更新 NVIDIA 驱动。
+2. 重新运行 `setup.bat`。
+3. 仍失败时运行 `setup.bat cpu`，先保证工具可用。
+
+### 显存不足
+
+从 `small/medium` 降到 `base/tiny`，或在界面中把设备改为 CPU。
+
+### 强制重新创建环境
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -ForceRecreate
 ```
-⚠️ 警告: GPU不可用，使用CPU处理（速度较慢）
-```
 
-说明GPU配置有问题，请重新检查上述步骤。
+相关官方资料：
 
----
-
-## 🐛 常见问题
-
-### Q1: 安装后仍然提示GPU不可用？
-
-**A**: 检查以下几点：
-
-1. **验证CUDA安装**
-   ```bash
-   nvidia-smi
-   ```
-   应该能看到GPU信息
-
-2. **检查PyTorch版本**
-   ```bash
-   pip show torch
-   ```
-   版本名应该包含 `+cu118` 或 `+cu121`，如果只有版本号说明是CPU版本
-
-3. **重新安装PyTorch GPU版本**
-   ```bash
-   pip uninstall torch torchvision torchaudio -y
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   ```
-
-### Q2: 提示 "CUDA out of memory"？
-
-**A**: GPU显存不足，尝试：
-
-1. 使用更小的模型（tiny, base）
-2. 关闭其他占用GPU的程序
-3. 降低音频质量或分段处理
-
-### Q3: 我有AMD显卡怎么办？
-
-**A**: 目前AMD显卡支持有限：
-
-1. **Windows**: 暂无简单方案，建议使用CPU
-2. **Linux**: 可以尝试 ROCm 版本的 PyTorch（复杂）
-
-### Q4: 没有NVIDIA显卡，有其他加速方式吗？
-
-**A**: 可以尝试：
-
-1. **使用更小的模型**（tiny比base快3-4倍）
-2. **减少音频采样率**
-3. **使用在线API服务**（OpenAI Whisper API）
-
-### Q5: 安装GPU版本会占用很多空间吗？
-
-**A**: 是的，GPU版本比CPU版本大约多占用 1-2GB 空间。
-
----
-
-## 📊 性能对比
-
-实际测试结果（10分钟音频，使用 base 模型）：
-
-| 设备 | 处理时间 | 加速比 |
-|------|---------|--------|
-| Intel i7-12700 (CPU) | 8分30秒 | 1x |
-| NVIDIA RTX 3060 (GPU) | 25秒 | 20x |
-| NVIDIA RTX 4090 (GPU) | 12秒 | 42x |
-
----
-
-## 🎓 推荐配置
-
-### 最低配置（CPU模式）
-- CPU: Intel i5 或 AMD Ryzen 5
-- 内存: 8GB
-- 模型: tiny, base
-
-### 推荐配置（GPU模式）
-- GPU: NVIDIA GTX 1060 6GB+
-- 内存: 8GB
-- 模型: base, small
-
-### 高性能配置（GPU模式）
-- GPU: NVIDIA RTX 3060+ (12GB+)
-- 内存: 16GB+
-- 模型: medium, large
-
----
-
-## 📝 总结
-
-**快速步骤**：
-
-1. ✅ 检查是否有 NVIDIA 显卡
-2. ✅ 安装最新 NVIDIA 驱动
-3. ✅ 运行 `nvidia-smi` 查看 CUDA 版本
-4. ✅ 安装对应版本的 PyTorch GPU
-5. ✅ 验证 GPU 可用
-6. ✅ 重新运行程序，享受加速！
-
-**如果配置成功**，处理速度会提升 **10-50倍**！🚀
-
+- [PyTorch 本地安装](https://docs.pytorch.org/get-started/locally/)
+- [CTranslate2 安装要求](https://opennmt.net/CTranslate2/installation.html)
+- [CTranslate2 硬件支持](https://opennmt.net/CTranslate2/hardware_support.html)

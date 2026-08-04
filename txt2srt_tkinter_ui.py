@@ -10,7 +10,13 @@ import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
-from txt2srt import align_audio_text, generate_srt, format_timestamp
+from txt2srt import (
+    Txt2SrtError,
+    align_audio_text,
+    format_timestamp,
+    generate_srt,
+    read_text_file,
+)
 
 
 class AudioTextAlignerUI:
@@ -27,7 +33,8 @@ class AudioTextAlignerUI:
         self.output_path = tk.StringVar()
         self.model_size = tk.StringVar(value="small")
         self.language = tk.StringVar(value="zh")
-        self.max_chars = tk.IntVar(value=40)
+        self.device = tk.StringVar(value="auto")
+        self.max_chars = tk.IntVar(value=30)
         
         self.is_processing = False
         
@@ -105,7 +112,7 @@ class AudioTextAlignerUI:
             width=15
         )
         model_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-        ttk.Label(settings_frame, text="(base=快速, medium=准确)").grid(
+        ttk.Label(settings_frame, text="(small=推荐, medium=更准确)").grid(
             row=0, column=2, sticky=tk.W, padx=5, pady=5
         )
         
@@ -123,10 +130,24 @@ class AudioTextAlignerUI:
             row=1, column=2, sticky=tk.W, padx=5, pady=5
         )
         
+        # 运行设备
+        ttk.Label(settings_frame, text="运行设备:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        device_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.device,
+            values=["auto", "cuda", "cpu"],
+            state="readonly",
+            width=15
+        )
+        device_combo.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="(auto=自动选择, cuda=NVIDIA GPU)").grid(
+            row=2, column=2, sticky=tk.W, padx=5, pady=5
+        )
+
         # 每行字数限制
-        ttk.Label(settings_frame, text="每行字数:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="每行字数:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
         chars_frame = ttk.Frame(settings_frame)
-        chars_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        chars_frame.grid(row=3, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
         
         self.chars_scale = ttk.Scale(
             chars_frame,
@@ -167,7 +188,8 @@ class AudioTextAlignerUI:
         # === 进度条 ===
         self.progress = ttk.Progressbar(
             main_frame,
-            mode='indeterminate',
+            mode='determinate',
+            maximum=100,
             length=400
         )
         self.progress.grid(row=6, column=0, columnspan=3, pady=5)
@@ -193,9 +215,27 @@ class AudioTextAlignerUI:
         
     def log(self, message):
         """添加日志消息"""
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self.log, message)
+            return
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+    def update_progress(self, value, message=None):
+        """从工作线程安全地更新进度与阶段说明。"""
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self.update_progress, value, message)
+            return
+        self.progress.configure(value=max(0, min(100, float(value) * 100)))
+        if message:
+            self.log(f"[{float(value):.0%}] {message}")
+
+    def set_processing_state(self, processing):
+        """在主线程切换按钮和进度条状态。"""
+        self.process_btn.config(state=tk.DISABLED if processing else tk.NORMAL)
+        if not processing:
+            self.progress.configure(value=0)
         
     def browse_audio(self):
         """浏览音频文件"""
@@ -244,6 +284,9 @@ class AudioTextAlignerUI:
     
     def clear_all(self):
         """清空所有输入"""
+        if self.is_processing:
+            messagebox.showwarning("警告", "任务正在处理中，暂时不能清空")
+            return
         self.audio_path.set("")
         self.text_path.set("")
         self.output_path.set("")
@@ -267,31 +310,43 @@ class AudioTextAlignerUI:
         if not self.output_path.get():
             messagebox.showerror("错误", "请指定输出文件路径")
             return
-        
+
+        task = {
+            "audio_path": self.audio_path.get(),
+            "text_path": self.text_path.get(),
+            "output_path": self.output_path.get(),
+            "model": self.model_size.get(),
+            "language": self.language.get(),
+            "device": self.device.get(),
+            "max_chars": self.max_chars.get(),
+        }
+        self.is_processing = True
+        self.set_processing_state(True)
+
         # 在新线程中处理，避免阻塞UI
-        thread = threading.Thread(target=self.process_thread)
+        thread = threading.Thread(
+            target=self.process_thread,
+            args=(task,),
+            name="txt2srt-worker",
+        )
         thread.daemon = True
         thread.start()
         
-    def process_thread(self):
+    def process_thread(self, task):
         """处理线程"""
-        self.is_processing = True
-        self.process_btn.config(state=tk.DISABLED)
-        self.progress.start()
-        
         try:
             self.log("=" * 60)
             self.log("🚀 开始处理...")
-            self.log(f"📁 音频文件: {os.path.basename(self.audio_path.get())}")
-            self.log(f"📝 文本文件: {os.path.basename(self.text_path.get())}")
-            self.log(f"🎯 模型大小: {self.model_size.get()}")
-            self.log(f"🌏 语言: {self.language.get()}")
-            self.log(f"📏 每行字数: {self.max_chars.get()} 字")
+            self.log(f"📁 音频文件: {os.path.basename(task['audio_path'])}")
+            self.log(f"📝 文本文件: {os.path.basename(task['text_path'])}")
+            self.log(f"🎯 模型大小: {task['model']}")
+            self.log(f"🌏 语言: {task['language']}")
+            self.log(f"🖥️ 运行设备: {task['device']}")
+            self.log(f"📏 每行字数: {task['max_chars']} 字")
             self.log("")
             
             # 读取文本
-            with open(self.text_path.get(), 'r', encoding='utf-8') as f:
-                text_content = f.read()
+            text_content = read_text_file(task["text_path"])
             
             self.log(f"📄 文本长度: {len(text_content)} 字符")
             self.log("")
@@ -300,25 +355,37 @@ class AudioTextAlignerUI:
             self.log("")
             
             # 处理音频
-            lang = None if self.language.get() == "auto" else self.language.get()
+            lang = None if task["language"] == "auto" else task["language"]
+            diagnostics = {}
             segments = align_audio_text(
-                self.audio_path.get(),
+                task["audio_path"],
                 text_content,
-                model_name=self.model_size.get(),
-                max_chars=self.max_chars.get()
+                model_name=task["model"],
+                max_chars=task["max_chars"],
+                language=lang,
+                device=task["device"],
+                progress_callback=self.update_progress,
+                diagnostics=diagnostics,
             )
             
             self.log(f"✅ 语音识别完成！识别到 {len(segments)} 个段落")
             self.log("")
             
             # 生成SRT
-            generate_srt(segments, self.output_path.get())
+            generate_srt(segments, task["output_path"])
             
-            self.log(f"✅ SRT文件已生成: {self.output_path.get()}")
+            self.log(f"✅ SRT文件已生成: {task['output_path']}")
             self.log("")
             self.log("📊 统计信息:")
             self.log(f"   - 字幕段落数: {len(segments)}")
             self.log(f"   - 音频时长: {segments[-1]['end']:.2f} 秒")
+            self.log(
+                f"   - 识别后端: {diagnostics.get('backend', 'Whisper')} / "
+                f"{str(diagnostics.get('device', task['device'])).upper()}"
+            )
+            self.log(f"   - 对齐相似度: {diagnostics.get('similarity', 0):.0%}")
+            for warning in diagnostics.get("warnings", []):
+                self.log(f"   - ⚠️ {warning}")
             self.log("")
             
             # 显示前3个段落预览
@@ -343,24 +410,29 @@ class AudioTextAlignerUI:
             self.root.after(0, lambda: messagebox.showinfo(
                 "处理完成",
                 f"字幕文件已成功生成！\n\n"
-                f"文件位置: {self.output_path.get()}\n"
+                f"文件位置: {task['output_path']}\n"
                 f"段落数量: {len(segments)}\n"
                 f"音频时长: {segments[-1]['end']:.2f} 秒"
             ))
             
+        except Txt2SrtError as e:
+            self.log("")
+            self.log(f"❌ 处理失败: {str(e)}")
+            self.root.after(0, lambda error=str(e): messagebox.showerror(
+                "处理失败", error
+            ))
         except Exception as e:
             self.log("")
             self.log(f"❌ 处理出错: {str(e)}")
             self.log("")
-            self.root.after(0, lambda: messagebox.showerror(
+            self.root.after(0, lambda error=str(e): messagebox.showerror(
                 "处理错误",
-                f"处理过程中出现错误:\n\n{str(e)}"
+                f"处理过程中出现错误:\n\n{error}"
             ))
             
         finally:
-            self.progress.stop()
-            self.process_btn.config(state=tk.NORMAL)
             self.is_processing = False
+            self.root.after(0, self.set_processing_state, False)
 
 
 def main():

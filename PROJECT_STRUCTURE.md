@@ -178,7 +178,7 @@ txt2srt/
   - gradio（Web界面）
   - torch（深度学习框架）
   - 其他必要依赖
-- **使用**：`pip install -r requirements.txt`
+- **使用**：`pip install --no-cache-dir -r requirements.txt`
 
 #### `.gitignore`
 - **用途**：Git版本控制忽略配置

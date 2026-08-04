@@ -15,6 +15,8 @@
 ### 安装
 确保已运行 `setup.bat` 安装了所有依赖（包括gradio）
 
+模型会保存到项目 `models`，Web 上传副本和临时输出保存到项目 `.runtime`，不会写入用户级缓存。
+
 ### 启动方式
 
 **方法1：使用快捷脚本（推荐）**
@@ -114,6 +116,7 @@ venv\Scripts\python txt2srt_tkinter_ui.py
 3. **调整设置**
    - 选择模型大小（base, small, medium等）
    - 选择语言（zh, en, auto等）
+   - 选择运行设备（auto, cuda, cpu）
 
 4. **开始处理**
    - 点击"🚀 开始处理"按钮
@@ -135,8 +138,9 @@ venv\Scripts\python txt2srt_tkinter_ui.py
 ├────────────────────────────────────────────────────────┤
 │ ⚙️ 设置                                                 │
 │                                                         │
-│ 模型大小: [base ▼] (base=快速, medium=准确)            │
+│ 模型大小: [small ▼] (small=推荐, medium=更准确)        │
 │ 语言:     [zh ▼]   (zh=中文, en=英文, auto=自动)       │
+│ 运行设备: [auto ▼] (auto=自动选择, cuda=NVIDIA GPU)    │
 ├────────────────────────────────────────────────────────┤
 │         [🚀 开始处理]    [🗑️ 清空]                      │
 │                                                         │
@@ -186,7 +190,7 @@ venv\Scripts\python txt2srt_tkinter_ui.py
 ### Gradio界面无法启动
 ```bash
 # 确保已安装gradio
-venv\Scripts\pip install gradio>=4.0.0
+venv\Scripts\python -m pip install --no-cache-dir gradio>=4.0.0
 
 # 检查端口是否被占用
 # 可以修改 txt2srt_ui.py 中的端口号（默认7860）
@@ -200,7 +204,7 @@ venv\Scripts\pip install gradio>=4.0.0
 
 ### 处理速度慢
 - 使用更小的模型（tiny或base）
-- 考虑使用GPU加速（需要CUDA）
+- 将运行设备设为 auto 或 cuda 以使用 NVIDIA GPU（需要CUDA）
 - 分段处理长音频
 
 ## 📞 技术支持

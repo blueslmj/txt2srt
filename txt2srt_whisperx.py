@@ -11,6 +11,11 @@ import argparse
 import re
 from typing import List, Dict
 
+from project_paths import FASTER_WHISPER_MODELS_DIR, configure_project_environment
+
+
+configure_project_environment()
+
 # WhisperX 相关导入
 import whisperx
 import torch
@@ -165,7 +170,12 @@ def align_audio_text_whisperx(
         print("⚠️ GPU不可用，使用CPU处理（速度较慢）")
     
     print(f"\n🎯 步骤1: 加载 WhisperX 模型 ({model_name})...")
-    model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    model = whisperx.load_model(
+        model_name,
+        device,
+        compute_type=compute_type,
+        download_root=str(FASTER_WHISPER_MODELS_DIR),
+    )
     
     print(f"🎯 步骤2: 使用 Whisper 进行初步识别...")
     audio = whisperx.load_audio(audio_path)

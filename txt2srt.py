@@ -1,853 +1,801 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-音频-文本对齐工具，生成SRT字幕文件
+"""Align an accurate transcript to audio and write SRT subtitles.
+
+The module deliberately keeps model imports lazy. Text segmentation, alignment,
+timeline cleanup, and SRT rendering can therefore be tested without installing
+the full speech-recognition stack.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import argparse
-import whisper
-import stable_whisper
-from typing import List, Dict, Tuple
+import os
 import re
-from dtw import dtw
-import numpy as np
+import sys
+import threading
+import unicodedata
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from project_paths import (
+    FASTER_WHISPER_MODELS_DIR,
+    OPENAI_WHISPER_MODELS_DIR,
+    configure_project_environment,
+)
+
+
+configure_project_environment()
+
+
+SUPPORTED_MODELS = (
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large",
+    "large-v2",
+    "large-v3",
+)
+SUPPORTED_DEVICES = ("auto", "cpu", "cuda")
+MAX_DTW_CELLS = 8_000_000
+ProgressCallback = Callable[[float, str], None]
+
+
+class Txt2SrtError(RuntimeError):
+    """Base exception for user-facing txt2srt failures."""
+
+
+class InputValidationError(Txt2SrtError, ValueError):
+    """Raised when an input cannot be processed safely."""
+
+
+class DependencyError(Txt2SrtError):
+    """Raised when the optional speech-recognition stack is unavailable."""
 
 
 def format_timestamp(seconds: float) -> str:
-    """
-    将秒数转换为SRT时间戳格式 (HH:MM:SS,mmm)
-    """
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    milliseconds = int((seconds % 1) * 1000)
+    """Convert seconds to a non-negative SRT timestamp."""
+    total_milliseconds = round(max(0.0, float(seconds)) * 1000)
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
 
 def split_text_into_segments(text: str, max_chars: int = 30) -> List[str]:
+    """Split transcript text into readable subtitle-sized segments.
+
+    Explicit line breaks take precedence, followed by sentence punctuation,
+    secondary punctuation, and finally a hard character limit.
     """
-    将长文本分割成适合字幕显示的短句
-    
-    优先级：
-    1. 换行符（最高优先级，强制分句）
-    2. 句子标点（。！？；等）
-    3. 逗号等次要标点
-    4. 长度限制（如果句子太长，强制按字数分割）
-    
-    Args:
-        text: 输入文本
-        max_chars: 每段最大字符数（默认30，适合视频字幕）
-    
-    Returns:
-        分割后的文本段落列表
-    """
-    segments = []
-    
-    # 第一步：按换行符分割（保留原文的段落结构）
-    lines = text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
+    if not isinstance(text, str) or not text.strip():
+        return []
+    if not 1 <= int(max_chars) <= 500:
+        raise InputValidationError("每条字幕字数必须在 1 到 500 之间")
+
+    segments: List[str] = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
         if not line:
             continue
-        
-        # 第二步：按主要标点符号分割每一行（句号、问号、感叹号等）
-        sentences = re.split(r'([。！？；.!?;])', line)
-        
-        current_segment = ""
-        
-        for i in range(0, len(sentences), 2):
-            sentence = sentences[i]
-            punct = sentences[i + 1] if i + 1 < len(sentences) else ""
-            
-            if not sentence.strip():
+
+        parts = re.split(r"([。！？；.!?;])", line)
+        current = ""
+        for index in range(0, len(parts), 2):
+            sentence = parts[index]
+            punctuation = parts[index + 1] if index + 1 < len(parts) else ""
+            if not sentence.strip() and not punctuation:
                 continue
-            
-            full_sentence = sentence + punct
-            potential_segment = current_segment + full_sentence
-            
-            # 如果累积的句子没超过长度限制，继续累积
-            if len(potential_segment) <= max_chars:
-                current_segment = potential_segment
+            candidate = sentence + punctuation
+            if current and len(current + candidate) <= max_chars:
+                current += candidate
+            elif not current and len(candidate) <= max_chars:
+                current = candidate
             else:
-                # 先输出已累积的内容
-                if current_segment:
-                    segments.append(current_segment.strip())
-                
-                # 处理当前句子（可能需要进一步分割）
-                if len(full_sentence) <= max_chars:
-                    current_segment = full_sentence
-                else:
-                    # 句子太长，需要进一步分割
-                    sub_segments = _split_long_sentence(full_sentence, max_chars)
-                    # 把前面的都加入segments，最后一个作为current_segment继续累积
-                    for sub in sub_segments[:-1]:
-                        segments.append(sub.strip())
-                    current_segment = sub_segments[-1] if sub_segments else ""
-        
-        # 每一行结束后，强制输出累积的内容
-        if current_segment.strip():
-            segments.append(current_segment.strip())
-    
+                if current.strip():
+                    segments.append(current.strip())
+                split_parts = _split_long_sentence(candidate, max_chars)
+                segments.extend(part.strip() for part in split_parts[:-1] if part.strip())
+                current = split_parts[-1] if split_parts else ""
+
+        if current.strip():
+            segments.append(current.strip())
+
     return segments
 
 
 def _split_long_sentence(sentence: str, max_chars: int) -> List[str]:
-    """
-    分割超长句子
-    
-    优先级：
-    1. 按逗号分割
-    2. 强制按字数分割
-    
-    Args:
-        sentence: 需要分割的长句
-        max_chars: 每段最大字符数
-    
-    Returns:
-        分割后的句子列表
-    """
     if len(sentence) <= max_chars:
         return [sentence]
-    
-    segments = []
-    
-    # 尝试按逗号分割
-    parts = re.split(r'([，,、])', sentence)
-    
+
+    result: List[str] = []
+    parts = re.split(r"([，,、：:])", sentence)
     current = ""
-    for i in range(0, len(parts), 2):
-        part = parts[i]
-        comma = parts[i + 1] if i + 1 < len(parts) else ""
-        
-        if not part.strip():
+    for index in range(0, len(parts), 2):
+        text = parts[index]
+        punctuation = parts[index + 1] if index + 1 < len(parts) else ""
+        candidate = text + punctuation
+        if not candidate:
             continue
-        
-        full_part = part + comma
-        potential = current + full_part
-        
-        if len(potential) <= max_chars:
-            current = potential
-        else:
-            if current:
-                segments.append(current.strip())
-            
-            # 如果单个部分仍然太长，强制按字数分割
-            if len(full_part) > max_chars:
-                force_split = _force_split_by_chars(full_part, max_chars)
-                segments.extend(force_split[:-1])
-                current = force_split[-1] if force_split else ""
-            else:
-                current = full_part
-    
+        if len(current + candidate) <= max_chars:
+            current += candidate
+            continue
+        if current.strip():
+            result.append(current.strip())
+        hard_parts = _force_split_by_chars(candidate, max_chars)
+        result.extend(part for part in hard_parts[:-1] if part)
+        current = hard_parts[-1] if hard_parts else ""
+
     if current.strip():
-        segments.append(current.strip())
-    
-    return segments if segments else [sentence]
+        result.append(current.strip())
+    return result or [sentence]
 
 
 def _force_split_by_chars(text: str, max_chars: int) -> List[str]:
-    """
-    强制按字数分割文本
-    
-    Args:
-        text: 要分割的文本
-        max_chars: 每段最大字符数
-    
-    Returns:
-        分割后的文本列表
-    """
-    segments = []
-    
-    while len(text) > max_chars:
-        # 尽量在标点处分割
-        split_pos = max_chars
-        
-        # 向前查找标点或空格
-        for i in range(max_chars - 1, max(0, max_chars - 10), -1):
-            if text[i] in '，,、 　':
-                split_pos = i + 1
+    result: List[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        split_at = max_chars
+        lower_bound = max(1, max_chars - 10)
+        for index in range(max_chars - 1, lower_bound - 1, -1):
+            if remaining[index] in "，,、：: 　":
+                split_at = index + 1
                 break
-        
-        segments.append(text[:split_pos].strip())
-        text = text[split_pos:].strip()
-    
-    if text:
-        segments.append(text)
-    
-    return segments
+        result.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        result.append(remaining)
+    return result
 
 
-def align_audio_text(audio_path: str, text: str, model_name: str = "base", use_gpu: bool = True, max_chars: int = 30) -> List[Dict]:
-    """
-    先用Whisper识别获取准确的时间戳，然后用用户文本替换识别文本
-    
-    核心思路：
-    1. Whisper识别音频 → 获取准确的时间戳（基于音频特征）
-    2. 提取识别出的句子 + 时间戳
-    3. 使用DTW算法匹配识别句子和用户句子
-    4. 用用户的正确文本替换识别文本，但保留Whisper的准确时间戳
-    
-    Args:
-        audio_path: 音频文件路径
-        text: 用户提供的准确文本
-        model_name: Whisper模型大小 (tiny, base, small, medium, large)
-        use_gpu: 是否使用GPU加速
-    
-    Returns:
-        包含时间戳的文本段落列表（使用用户提供的文本 + Whisper的时间戳）
-    """
-    import torch
-    
-    # 检查GPU可用性
-    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-    if use_gpu and not torch.cuda.is_available():
-        print("⚠️ 警告: GPU不可用，使用CPU处理（速度较慢）")
-        print("   如需GPU加速，请安装CUDA版本的PyTorch")
-    else:
-        print(f"✅ 使用设备: {device.upper()}")
-    
-    print(f"加载Whisper模型 (Faster-Whisper增强版): {model_name}...")
-    # 使用stable-ts加载faster-whisper模型
-    # ⚠️ 修复 cuBLAS 错误: 回退到 float16，int8_float16 在部分环境会导致 CUBLAS_STATUS_NOT_SUPPORTED
-    compute_type = "float16" if device == "cuda" else "int8"
-    print(f"   - 计算精度: {compute_type} (兼容性模式)")
-    
-    model = stable_whisper.load_faster_whisper(model_name, device=device, compute_type=compute_type)
-    
-    print(f"正在处理音频文件: {audio_path}")
-    print("🎯 步骤1: 使用Faster-Whisper识别音频，获取准确的时间戳...")
-    
-    # 使用stable-ts识别音频（获取精确的句子级时间戳）
-    result = model.transcribe(
-        audio_path,
-        language="zh",
-        word_timestamps=True,
-        verbose=False,
-        regroup=True,     # 重新分组，获得合理的句子切分
-        beam_size=1,      # 强制使用 Greedy Loading，大幅进一步提速
-        temperature=0,    # 确定性输出
-        vad_filter=True,  # ⚡️ 性能优化核心 2: 开启 VAD (语音活动检测)，跳过静音片段
-        vad_parameters=dict(min_silence_duration_ms=500), # 只有超过500ms的静音才跳过
+def normalize_for_alignment(text: str) -> str:
+    """Normalize text while retaining only characters useful for alignment."""
+    normalized = unicodedata.normalize("NFKC", str(text)).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace()
+        and not unicodedata.category(character).startswith(("P", "S"))
     )
-    
-    # 提取识别出的句子和时间戳
-    recognized_segments = []
-    for segment in result.segments:
-        recognized_segments.append({
-            "start": segment.start,
-            "end": segment.end,
-            "text": segment.text.strip()
-        })
-    
-    print(f"   Whisper识别到 {len(recognized_segments)} 个语音段落")
-    
-    # 显示前几个识别结果（调试用）
-    if len(recognized_segments) > 0:
-        print("\n📝 识别的前3个段落（含时间戳）:")
-        for i, seg in enumerate(recognized_segments[:3]):
-            print(f"   [{i+1}] {seg['start']:.1f}s - {seg['end']:.1f}s: {seg['text'][:30]}...")
-    
-    print("\n🎯 步骤2: 将用户文本分割成句子...")
-    user_sentences = split_text_into_segments(text, max_chars=max_chars)
-    print(f"   用户文本有 {len(user_sentences)} 个句子（每行限制 {max_chars} 字）")
-    
-    # 显示前几个用户句子
-    if len(user_sentences) > 0:
-        print("\n📝 用户的前3个句子:")
-        for i, sentence in enumerate(user_sentences[:3]):
-            print(f"   [{i+1}] {sentence[:30]}...")
-    
-    print("\n🎯 步骤3: 使用DTW算法匹配识别文本和用户文本...")
-    
-    # 使用DTW在字符级别匹配
-    aligned_segments = match_user_text_to_timestamps(
-        recognized_segments, 
-        user_sentences
+
+
+def remove_punctuation(text: str) -> str:
+    """Backward-compatible alias used by integrations based on the reference project."""
+    return normalize_for_alignment(text)
+
+
+def read_text_file(path: str) -> str:
+    """Read common Chinese/UTF text encodings with actionable errors."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise InputValidationError(f"文本文件不存在: {path}")
+    errors: List[str] = []
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return file_path.read_text(encoding=encoding)
+        except UnicodeDecodeError as exc:
+            errors.append(f"{encoding}: {exc}")
+    raise InputValidationError(
+        "无法读取文本文件，请将文件保存为 UTF-8 或 GB18030 编码。"
+        f" 详情: {'; '.join(errors)}"
     )
-    
-    print(f"\n🎯 步骤4: 修复时间戳重叠与微调字幕体验...")
-    
-    # 修复重叠的时间戳，确保严格按时间顺序
-    aligned_segments = fix_overlapping_timestamps(aligned_segments)
-    
-    # 进一步优化字幕持续时间（消除闪烁感，填补小空隙）
-    aligned_segments = optimize_subtitle_duration(aligned_segments)
-    
-    print(f"\n✅ 对齐完成！生成了 {len(aligned_segments)} 个字幕段落")
-    print(f"   保留了Whisper的准确时间戳，使用了用户的正确文本")
-    
-    return aligned_segments
 
 
-def match_user_text_to_timestamps(recognized_segments: List[Dict], user_sentences: List[str]) -> List[Dict]:
-    """
-    使用DTW算法匹配用户句子和识别句子，用用户文本替换识别文本但保留时间戳
-    
-    策略：
-    1. 提取识别句子和用户句子的字符序列
-    2. 使用DTW找到字符级别的对应关系
-    3. 根据对应关系，将用户句子映射到识别句子的时间戳
-    
-    Args:
-        recognized_segments: Whisper识别的句子列表（含准确时间戳）
-        user_sentences: 用户提供的正确句子列表
-    
-    Returns:
-        对齐后的句子列表（用户文本 + Whisper时间戳）
-    """
-    if len(recognized_segments) == 0 or len(user_sentences) == 0:
-        print("⚠️ 文本为空，无法对齐")
+def validate_inputs(audio_path: str, text: str, max_chars: int) -> None:
+    audio = Path(audio_path)
+    if not audio.is_file():
+        raise InputValidationError(f"音频文件不存在: {audio_path}")
+    if not isinstance(text, str) or not text.strip():
+        raise InputValidationError("文本内容为空，请输入文稿或上传非空文本文件")
+    if not 1 <= int(max_chars) <= 500:
+        raise InputValidationError("每条字幕字数必须在 1 到 500 之间")
+
+
+def _import_torch() -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise DependencyError(
+            "缺少 PyTorch，无法执行语音识别。Windows 请先运行 setup.bat"
+        ) from exc
+    return torch
+
+
+def resolve_device(device: str = "auto") -> str:
+    """Resolve auto/cpu/cuda and reject an unavailable explicit CUDA request."""
+    requested = str(device or "auto").strip().lower()
+    if requested not in SUPPORTED_DEVICES:
+        raise InputValidationError(
+            f"不支持的运行设备: {device}（可选: {', '.join(SUPPORTED_DEVICES)}）"
+        )
+    torch = _import_torch()
+    cuda_available = bool(torch.cuda.is_available())
+    if requested == "cuda" and not cuda_available:
+        raise InputValidationError("CUDA 当前不可用，请选择“自动选择”或 CPU")
+    return "cuda" if requested == "auto" and cuda_available else (
+        "cpu" if requested == "auto" else requested
+    )
+
+
+def find_local_faster_whisper_model(model_name: str) -> Optional[str]:
+    """Find a complete faster-whisper snapshot in project-local storage."""
+    cache_roots: List[Path] = []
+    explicit_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+    hf_home = os.environ.get("HF_HOME")
+    if explicit_cache:
+        cache_roots.append(Path(explicit_cache))
+    if hf_hub_cache:
+        cache_roots.append(Path(hf_hub_cache))
+    if hf_home:
+        cache_roots.append(Path(hf_home) / "hub")
+    cache_roots.append(FASTER_WHISPER_MODELS_DIR)
+
+    model_folder = f"models--Systran--faster-whisper-{model_name}"
+    for cache_root in dict.fromkeys(cache_roots):
+        snapshots = cache_root / model_folder / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        candidates = sorted(
+            (item for item in snapshots.iterdir() if item.is_dir()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if (candidate / "model.bin").is_file() and (candidate / "config.json").is_file():
+                return str(candidate)
+    return None
+
+
+_model_cache: Dict[Tuple[str, str, str], Tuple[Any, bool, str]] = {}
+_model_cache_lock = threading.Lock()
+
+
+def get_whisper_model(
+    model_name: str,
+    device: str = "auto",
+    backend: str = "auto",
+) -> Tuple[Any, bool, str]:
+    """Load and cache a Whisper model, preferring faster-whisper and local files."""
+    model_name = str(model_name).strip().lower()
+    if model_name not in SUPPORTED_MODELS:
+        raise InputValidationError(
+            f"不支持的 Whisper 模型: {model_name}（可选: {', '.join(SUPPORTED_MODELS)}）"
+        )
+    runtime_device = resolve_device(device)
+    backend = str(backend or "auto").strip().lower()
+    if backend not in ("auto", "faster", "openai"):
+        raise InputValidationError("识别后端仅支持 auto、faster 或 openai")
+
+    cache_key = (model_name, runtime_device, backend)
+    with _model_cache_lock:
+        if cache_key in _model_cache:
+            return _model_cache[cache_key]
+
+        try:
+            import stable_whisper
+        except ImportError as exc:
+            raise DependencyError(
+                "缺少 stable-ts，无法加载 Whisper。Windows 请先运行 setup.bat"
+            ) from exc
+
+        load_errors: List[str] = []
+        if backend in ("auto", "faster"):
+            source = find_local_faster_whisper_model(model_name) or model_name
+            compute_type = "float16" if runtime_device == "cuda" else "int8"
+            try:
+                model = stable_whisper.load_faster_whisper(
+                    source,
+                    device=runtime_device,
+                    compute_type=compute_type,
+                    download_root=str(FASTER_WHISPER_MODELS_DIR),
+                )
+                loaded = (model, True, "faster-whisper")
+                _model_cache[cache_key] = loaded
+                return loaded
+            except Exception as exc:  # model loaders expose backend-specific errors
+                load_errors.append(f"faster-whisper: {exc}")
+                if backend == "faster":
+                    raise Txt2SrtError("Faster-Whisper 模型加载失败: " + str(exc)) from exc
+
+        try:
+            model = stable_whisper.load_model(
+                model_name,
+                device=runtime_device,
+                download_root=str(OPENAI_WHISPER_MODELS_DIR),
+            )
+            loaded = (model, False, "openai-whisper")
+            _model_cache[cache_key] = loaded
+            return loaded
+        except Exception as exc:
+            load_errors.append(f"openai-whisper: {exc}")
+            raise Txt2SrtError(
+                "Whisper 模型加载失败。请检查网络、项目 models 目录和可用磁盘空间。"
+                f" 详情: {'; '.join(load_errors)}"
+            ) from exc
+
+
+def clear_model_cache() -> None:
+    """Release cached model references, primarily useful for tests or device changes."""
+    with _model_cache_lock:
+        _model_cache.clear()
+
+
+def _notify(callback: Optional[ProgressCallback], progress: float, message: str) -> None:
+    print(message)
+    if callback:
+        callback(max(0.0, min(1.0, float(progress))), message)
+
+
+def _normalize_language(language: Optional[str]) -> Optional[str]:
+    if language is None:
+        return None
+    normalized = str(language).strip().lower()
+    return None if normalized in ("", "auto", "none", "自动检测") else normalized
+
+
+def transcribe_audio(
+    audio_path: str,
+    model_name: str = "small",
+    language: Optional[str] = "zh",
+    device: str = "auto",
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Transcribe audio into timestamped recognition segments."""
+    runtime_device = resolve_device(device)
+    _notify(progress_callback, 0.08, f"运行设备：{runtime_device.upper()}")
+    _notify(progress_callback, 0.14, f"加载 Whisper 模型：{model_name}")
+    model, is_faster, backend_name = get_whisper_model(model_name, runtime_device)
+
+    transcribe_kwargs: Dict[str, Any] = {
+        "word_timestamps": True,
+        "verbose": False,
+        "regroup": True,
+        "beam_size": 1,
+        "temperature": 0,
+    }
+    normalized_language = _normalize_language(language)
+    if normalized_language:
+        transcribe_kwargs["language"] = normalized_language
+    if is_faster:
+        transcribe_kwargs.update(
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+
+    _notify(progress_callback, 0.28, f"识别音频（{backend_name}）")
+    try:
+        result = model.transcribe(audio_path, **transcribe_kwargs)
+    except TypeError as exc:
+        # Older stable-ts/faster-whisper combinations may not expose VAD tuning.
+        if "vad_parameters" not in str(exc):
+            raise
+        transcribe_kwargs.pop("vad_parameters", None)
+        result = model.transcribe(audio_path, **transcribe_kwargs)
+    except Exception as exc:
+        raise Txt2SrtError(
+            f"音频识别失败: {exc}。请确认音频可解码，并检查 FFmpeg 是否可用。"
+        ) from exc
+
+    raw_segments = getattr(result, "segments", None)
+    if raw_segments is None and isinstance(result, dict):
+        raw_segments = result.get("segments", [])
+
+    segments: List[Dict[str, Any]] = []
+    for raw_segment in raw_segments or []:
+        if isinstance(raw_segment, dict):
+            start = raw_segment.get("start", 0.0)
+            end = raw_segment.get("end", start)
+            recognized_text = raw_segment.get("text", "")
+        else:
+            start = getattr(raw_segment, "start", 0.0)
+            end = getattr(raw_segment, "end", start)
+            recognized_text = getattr(raw_segment, "text", "")
+        recognized_text = str(recognized_text).strip()
+        if recognized_text and float(end) > float(start):
+            segments.append(
+                {"start": float(start), "end": float(end), "text": recognized_text}
+            )
+
+    if not segments:
+        raise Txt2SrtError("未识别到有效语音，请检查音频是否包含清晰人声")
+    _notify(progress_callback, 0.5, f"识别到 {len(segments)} 个语音段落")
+    return segments, {
+        "model": model_name,
+        "device": runtime_device,
+        "backend": backend_name,
+        "language": normalized_language or "auto",
+    }
+
+
+def _fill_character_mapping(
+    mapping: List[Optional[int]], recognized_count: int
+) -> List[int]:
+    """Fill unmatched character positions by monotonic linear interpolation."""
+    user_count = len(mapping)
+    if user_count == 0 or recognized_count == 0:
         return []
-    
-    # 移除标点符号的辅助函数
-    def remove_punctuation(text):
-        return ''.join([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-    
-    # 提取识别文本的字符序列（去除标点）
-    recognized_text = ''.join([seg["text"] for seg in recognized_segments])
-    recognized_chars = list(remove_punctuation(recognized_text))
-    
-    # 提取用户文本的字符序列（去除标点）
-    user_text = ''.join(user_sentences)
-    user_chars = list(remove_punctuation(user_text))
-    
-    print(f"   识别文本: {len(recognized_chars)} 个字符")
-    print(f"   用户文本: {len(user_chars)} 个字符")
-    
-    # 构建DTW距离矩阵
-    n_user = len(user_chars)
-    n_recognized = len(recognized_chars)
-    
-    distance_matrix = np.zeros((n_user, n_recognized))
-    for i in range(n_user):
-        for j in range(n_recognized):
-            distance_matrix[i, j] = 0 if user_chars[i] == recognized_chars[j] else 1
-    
-    # 运行DTW算法
-    print("   运行DTW算法进行字符级匹配...")
+    anchors = [(index, value) for index, value in enumerate(mapping) if value is not None]
+    if not anchors:
+        if user_count == 1:
+            return [0]
+        return [
+            round(index * (recognized_count - 1) / (user_count - 1))
+            for index in range(user_count)
+        ]
+
+    if anchors[0][0] != 0:
+        anchors.insert(0, (0, 0))
+    if anchors[-1][0] != user_count - 1:
+        anchors.append((user_count - 1, recognized_count - 1))
+
+    filled: List[Optional[int]] = list(mapping)
+    for (left_index, left_value), (right_index, right_value) in zip(anchors, anchors[1:]):
+        width = right_index - left_index
+        for index in range(left_index, right_index + 1):
+            if filled[index] is None:
+                ratio = 0.0 if width == 0 else (index - left_index) / width
+                filled[index] = round(left_value + ratio * (right_value - left_value))
+
+    result: List[int] = []
+    last_value = 0
+    for value in filled:
+        bounded = max(last_value, min(recognized_count - 1, int(value or 0)))
+        result.append(bounded)
+        last_value = bounded
+    return result
+
+
+def _sequence_character_mapping(user_text: str, recognized_text: str) -> List[int]:
+    matcher = SequenceMatcher(None, user_text, recognized_text, autojunk=False)
+    mapping: List[Optional[int]] = [None] * len(user_text)
+    for user_start, recognized_start, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            mapping[user_start + offset] = recognized_start + offset
+    return _fill_character_mapping(mapping, len(recognized_text))
+
+
+def _dtw_character_mapping(user_text: str, recognized_text: str) -> Optional[List[int]]:
+    if len(user_text) * len(recognized_text) > MAX_DTW_CELLS:
+        return None
+    try:
+        import numpy as np
+        from dtw import dtw
+    except ImportError:
+        return None
+
+    user_chars = np.asarray(list(user_text), dtype="U1")[:, None]
+    recognized_chars = np.asarray(list(recognized_text), dtype="U1")[None, :]
+    distance_matrix = (user_chars != recognized_chars).astype(np.float64)
     alignment = dtw(distance_matrix)
-    
-    # 获取对齐路径
-    path = list(zip(alignment.index1, alignment.index2))
-    
-    match_rate = (1 - alignment.normalizedDistance) * 100
-    print(f"   ✅ DTW匹配成功，相似度: {match_rate:.1f}%")
-    
-    # 为每个识别字符建立索引（字符 → 所属的segment和segment内的位置）
-    recognized_char_to_segment = []
-    for seg_idx, segment in enumerate(recognized_segments):
-        seg_text = remove_punctuation(segment["text"])
-        for char_idx, char in enumerate(seg_text):
-            recognized_char_to_segment.append({
-                "seg_idx": seg_idx,
-                "char_idx": char_idx,
-                "total_chars": len(seg_text),
-                "segment": segment
-            })
-    
-    # 为每个用户字符找到对应的识别segment
-    user_char_to_segment = [None] * n_user
-    for user_idx, rec_idx in path:
-        if rec_idx < len(recognized_char_to_segment):
-            user_char_to_segment[user_idx] = recognized_char_to_segment[rec_idx]
-    
-    # 建立更精细的映射：为每个用户字符找到对应的时间戳
-    user_char_times = []
-    for i in range(n_user):
-        if user_char_to_segment[i] is not None:
-            seg_info = user_char_to_segment[i]
-            segment = seg_info["segment"]
-            
-            # 在segment内部进行时间插值
-            segment_duration = segment["end"] - segment["start"]
-            total_chars = seg_info["total_chars"]
-            
-            if total_chars > 0:
-                char_time = segment["start"] + (seg_info["char_idx"] / total_chars) * segment_duration
-            else:
-                char_time = segment["start"]
-            
-            user_char_times.append(char_time)
-        else:
-            # 没有匹配到，稍后插值
-            user_char_times.append(None)
-    
-    # 对未匹配的字符进行线性插值
-    for i in range(n_user):
-        if user_char_times[i] is None:
-            # 向前找最近的有效时间
-            prev_time = 0.0
-            for j in range(i - 1, -1, -1):
-                if user_char_times[j] is not None:
-                    prev_time = user_char_times[j]
-                    break
-            
-            # 向后找最近的有效时间
-            next_time = recognized_segments[-1]["end"] if recognized_segments else 0.0
-            for j in range(i + 1, n_user):
-                if user_char_times[j] is not None:
-                    next_time = user_char_times[j]
-                    break
-            
-            user_char_times[i] = (prev_time + next_time) / 2
-    
-    # 现在为每个用户句子分配时间戳
-    aligned_segments = []
-    char_idx = 0
-    
+
+    sums = [0] * len(user_text)
+    counts = [0] * len(user_text)
+    for user_index, recognized_index in zip(alignment.index1, alignment.index2):
+        user_index = int(user_index)
+        sums[user_index] += int(recognized_index)
+        counts[user_index] += 1
+    mapping: List[Optional[int]] = [
+        round(total / count) if count else None
+        for total, count in zip(sums, counts)
+    ]
+    return _fill_character_mapping(mapping, len(recognized_text))
+
+
+def _recognized_character_times(
+    recognized_segments: Sequence[Dict[str, Any]],
+) -> Tuple[str, List[Tuple[float, float]]]:
+    recognized_text_parts: List[str] = []
+    character_times: List[Tuple[float, float]] = []
+    for segment in recognized_segments:
+        clean_text = normalize_for_alignment(segment.get("text", ""))
+        if not clean_text:
+            continue
+        start = max(0.0, float(segment.get("start", 0.0)))
+        end = max(start, float(segment.get("end", start)))
+        duration = end - start
+        character_count = len(clean_text)
+        recognized_text_parts.append(clean_text)
+        for index in range(character_count):
+            character_times.append(
+                (
+                    start + duration * index / character_count,
+                    start + duration * (index + 1) / character_count,
+                )
+            )
+    return "".join(recognized_text_parts), character_times
+
+
+def match_user_text_to_timestamps(
+    recognized_segments: Sequence[Dict[str, Any]],
+    user_sentences: Sequence[str],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Map the accurate user transcript onto Whisper's recognition timeline."""
+    if not recognized_segments:
+        raise Txt2SrtError("Whisper 没有返回可用于对齐的语音段落")
+    if not user_sentences:
+        raise InputValidationError("文本切分后为空，无法生成字幕")
+
+    recognized_text, character_times = _recognized_character_times(recognized_segments)
+    user_text = "".join(normalize_for_alignment(sentence) for sentence in user_sentences)
+    if not recognized_text:
+        raise Txt2SrtError("识别结果仅包含标点或空白，无法建立时间轴")
+    if not user_text:
+        raise InputValidationError("文本不包含可对齐的文字或数字")
+
+    length_difference = abs(len(user_text) - len(recognized_text)) / max(
+        len(user_text), len(recognized_text), 1
+    )
+    similarity = SequenceMatcher(
+        None, user_text, recognized_text, autojunk=False
+    ).ratio()
+    mapping = _dtw_character_mapping(user_text, recognized_text)
+    algorithm = "dtw" if mapping is not None else "sequence"
+    if mapping is None:
+        mapping = _sequence_character_mapping(user_text, recognized_text)
+
+    warnings: List[str] = []
+    if length_difference > 0.2:
+        warnings.append(
+            f"文稿与识别文本的字符数相差 {length_difference:.0%}，请抽查字幕时间轴"
+        )
+    if similarity < 0.55:
+        warnings.append(
+            f"文稿与识别文本的相似度仅 {similarity:.0%}，两者可能不是同一内容"
+        )
+    if algorithm == "sequence" and len(user_text) * len(recognized_text) > MAX_DTW_CELLS:
+        warnings.append("文本较长，已自动使用低内存对齐模式")
+
+    if diagnostics is not None:
+        diagnostics.update(
+            recognized_chars=len(recognized_text),
+            source_chars=len(user_text),
+            length_difference=length_difference,
+            similarity=similarity,
+            alignment_algorithm=algorithm,
+            warnings=warnings,
+        )
+
+    aligned: List[Dict[str, Any]] = []
+    user_offset = 0
     for sentence in user_sentences:
-        if not sentence.strip():
+        clean_sentence = normalize_for_alignment(sentence)
+        if not clean_sentence:
             continue
-        
-        # 提取句子的纯字符
-        sentence_chars = remove_punctuation(sentence)
-        
-        if len(sentence_chars) == 0:
-            # 纯标点句子，使用估算时长
-            if aligned_segments:
-                last_end = aligned_segments[-1]["end"]
-                aligned_segments.append({
-                    "start": last_end,
-                    "end": last_end + 0.5,
-                    "text": sentence.strip()
-                })
-            continue
-        
-        # 找到这个句子对应的字符范围
-        start_char_idx = char_idx
-        end_char_idx = min(char_idx + len(sentence_chars), n_user)
-        
-        if start_char_idx >= n_user:
-            # 超出范围，使用估算
-            if aligned_segments:
-                last_end = aligned_segments[-1]["end"]
-                estimated_duration = len(sentence_chars) * 0.15
-                aligned_segments.append({
-                    "start": last_end,
-                    "end": last_end + estimated_duration,
-                    "text": sentence.strip()
-                })
-                print(f"   ⚠️ [{len(aligned_segments)}] 超出匹配范围，使用估算时长")
-            break
-        
-        # 使用字符时间戳
-        start_time = user_char_times[start_char_idx]
-        end_time = user_char_times[min(end_char_idx - 1, n_user - 1)]
-        
-        # 确保时长合理（至少0.5秒）
-        if end_time - start_time < 0.5:
-            end_time = start_time + max(0.5, len(sentence_chars) * 0.15)
-        
-        aligned_segments.append({
-            "start": start_time,
-            "end": end_time,
-            "text": sentence.strip()
-        })
-        
-        # 调试信息（前5句和后5句）
-        if len(aligned_segments) <= 5 or len(user_sentences) - len(aligned_segments) < 5:
-            duration = end_time - start_time
-            print(f"   [{len(aligned_segments)}] {start_time:.1f}s-{end_time:.1f}s ({duration:.1f}s): {sentence[:20]}...")
-        
-        char_idx = end_char_idx
-    
-    # 检查是否所有句子都被处理了
-    if len(aligned_segments) < len(user_sentences):
-        missing = len(user_sentences) - len(aligned_segments)
-        print(f"   ⚠️ 警告: {missing} 个句子未能匹配，将使用估算时长")
-    
-    return aligned_segments
-
-
-def calculate_similarity(text1: str, text2: str) -> float:
-    """
-    计算两个文本的相似度（基于最长公共子序列）
-    
-    Args:
-        text1: 第一个文本
-        text2: 第二个文本
-    
-    Returns:
-        相似度 (0-1之间)
-    """
-    # 移除标点和空格
-    clean1 = ''.join([c for c in text1 if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-    clean2 = ''.join([c for c in text2 if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-    
-    if len(clean1) == 0 or len(clean2) == 0:
-        return 0.0
-    
-    # 计算最长公共子序列长度（简化版，用于快速匹配）
-    # 这里用简单的字符匹配计数
-    matches = 0
-    for char in clean1:
-        if char in clean2:
-            matches += 1
-    
-    # 相似度 = 匹配字符数 / 较长文本的长度
-    similarity = matches / max(len(clean1), len(clean2))
-    
-    return similarity
-
-
-def align_user_text_with_timestamps(user_sentences: List[str], words_with_time: List[Dict]) -> List[Dict]:
-    """
-    将用户提供的文本与带时间戳的识别词对齐（基于滑动窗口匹配）
-    
-    Args:
-        user_sentences: 用户文本分割后的句子列表
-        words_with_time: Whisper识别出的词及时间戳
-    
-    Returns:
-        对齐后的段落列表
-    """
-    aligned_segments = []
-    total_words = len(words_with_time)
-    
-    if total_words == 0:
-        print("⚠️ 警告：Whisper没有识别出任何词，无法对齐")
-        return aligned_segments
-    
-    audio_duration = words_with_time[-1]["end"]
-    
-    print(f"📊 对齐统计：")
-    print(f"   - 用户文本: {len(user_sentences)} 个句子")
-    print(f"   - Whisper识别: {total_words} 个词")
-    print(f"   - 音频时长: {audio_duration:.1f} 秒")
-    print(f"🔍 开始滑动窗口匹配...")
-    
-    # 当前在词列表中的起始位置
-    current_word_idx = 0
-    
-    for sent_idx, user_sentence in enumerate(user_sentences):
-        if not user_sentence.strip():
-            continue
-        
-        # 移除标点的用户句子
-        user_clean = ''.join([c for c in user_sentence if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-        
-        if len(user_clean) == 0:
-            continue
-        
-        user_len = len(user_clean)
-        
-        # 估算这个句子需要多少个词（中文平均一个词2-3个字）
-        estimated_words = max(5, int(user_len / 2.5))
-        
-        best_match_score = 0
-        best_start_idx = current_word_idx
-        best_end_idx = min(current_word_idx + estimated_words, total_words)
-        
-        # 滑动窗口查找最佳匹配
-        # 窗口大小范围：estimated_words的50% 到 200%
-        min_window = max(3, int(estimated_words * 0.5))
-        max_window = min(int(estimated_words * 2), total_words - current_word_idx)
-        
-        for window_size in range(min_window, max_window + 1):
-            # 尝试不同的起始位置（允许向前或向后微调）
-            for start_offset in range(-3, 4):
-                start_idx = current_word_idx + start_offset
-                end_idx = start_idx + window_size
-                
-                if start_idx < 0 or end_idx > total_words:
-                    continue
-                
-                # 提取这个窗口内的文本
-                window_text = ""
-                for i in range(start_idx, end_idx):
-                    word = words_with_time[i]["word"].strip()
-                    clean_word = ''.join([c for c in word if c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-                    window_text += clean_word
-                
-                # 计算相似度
-                similarity = calculate_similarity(user_sentence, window_text)
-                
-                # 如果相似度更高，更新最佳匹配
-                if similarity > best_match_score:
-                    best_match_score = similarity
-                    best_start_idx = start_idx
-                    best_end_idx = end_idx
-        
-        # 使用最佳匹配的时间戳
-        if best_start_idx < total_words and best_end_idx > best_start_idx:
-            start_time = words_with_time[best_start_idx]["start"]
-            end_time = words_with_time[min(best_end_idx - 1, total_words - 1)]["end"]
-            
-            aligned_segments.append({
+        start_user_index = user_offset
+        end_user_index = user_offset + len(clean_sentence) - 1
+        start_recognized_index = mapping[start_user_index]
+        end_recognized_index = mapping[end_user_index]
+        start_time = character_times[start_recognized_index][0]
+        end_time = character_times[end_recognized_index][1]
+        aligned.append(
+            {
                 "start": start_time,
-                "end": end_time,
-                "text": user_sentence.strip()
-            })
-            
-            # 更新当前位置
-            current_word_idx = best_end_idx
-            
-            # 调试信息（前10句）
-            if len(aligned_segments) <= 10:
-                duration = end_time - start_time
-                print(f"   句子 {len(aligned_segments)}: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s), 相似度 {best_match_score*100:.0f}%")
-        else:
-            # 如果无法匹配，使用估算的时间
-            if aligned_segments:
-                last_end = aligned_segments[-1]["end"]
-                estimated_duration = len(user_clean) * 0.3  # 假设每字0.3秒
-                aligned_segments.append({
-                    "start": last_end,
-                    "end": min(last_end + estimated_duration, audio_duration),
-                    "text": user_sentence.strip()
-                })
-            else:
-                # 第一句话找不到匹配，从0开始
-                estimated_duration = len(user_clean) * 0.3
-                aligned_segments.append({
-                    "start": 0.0,
-                    "end": min(estimated_duration, audio_duration),
-                    "text": user_sentence.strip()
-                })
-    
-    print(f"✅ 对齐完成！生成了 {len(aligned_segments)} 个字幕段落")
-    
-    return aligned_segments
+                "end": max(end_time, start_time + 0.5),
+                "text": sentence.strip(),
+            }
+        )
+        user_offset += len(clean_sentence)
+    return aligned
 
 
-def align_text_by_segments(whisper_segments: List[Dict], user_sentences: List[str]) -> List[Dict]:
-    """
-    当没有词级时间戳时，使用段落级对齐
-    
-    Args:
-        whisper_segments: Whisper识别的段落
-        user_sentences: 用户文本句子
-    
-    Returns:
-        对齐后的段落列表
-    """
-    aligned_segments = []
-    
-    # 简单策略：平均分配时间
-    if not whisper_segments:
-        return aligned_segments
-    
-    total_duration = whisper_segments[-1]["end"]
-    sentence_duration = total_duration / len(user_sentences)
-    
-    for i, sentence in enumerate(user_sentences):
-        if sentence.strip():
-            aligned_segments.append({
-                "start": i * sentence_duration,
-                "end": (i + 1) * sentence_duration,
-                "text": sentence.strip()
-            })
-    
-    return aligned_segments
+def fix_overlapping_timestamps(
+    segments: Sequence[Dict[str, Any]],
+    min_duration: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Preserve transcript order while producing a non-overlapping timeline."""
+    if not segments:
+        return []
+    starts: List[float] = []
+    for segment in segments:
+        start = max(0.0, float(segment.get("start", 0.0)))
+        if starts and start <= starts[-1]:
+            start = starts[-1] + 0.01
+        starts.append(start)
+
+    fixed: List[Dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        start = starts[index]
+        raw_end = max(start, float(segment.get("end", start)))
+        end = max(raw_end, start + max(0.01, min_duration))
+        if index + 1 < len(starts):
+            end = min(end, starts[index + 1])
+        if end <= start:
+            end = start + 0.01
+        item = dict(segment)
+        item.update(start=start, end=end, text=str(segment.get("text", "")).strip())
+        fixed.append(item)
+    return fixed
 
 
-def generate_srt(segments: List[Dict], output_path: str):
-    """
-    生成SRT字幕文件
-    
-    Args:
-        segments: 包含时间戳的文本段落列表
-        output_path: 输出SRT文件路径
-    """
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for i, segment in enumerate(segments, 1):
-            # 写入序号
-            f.write(f"{i}\n")
-            # 写入时间戳
-            start_time = format_timestamp(segment["start"])
-            end_time = format_timestamp(segment["end"])
-            f.write(f"{start_time} --> {end_time}\n")
-            # 写入文本
-            f.write(f"{segment['text']}\n")
-            # 空行分隔
-            f.write("\n")
-    
-    print(f"SRT字幕文件已生成: {output_path}")
+def optimize_subtitle_duration(
+    segments: Sequence[Dict[str, Any]],
+    max_extension: float = 0.5,
+    subtitle_gap: float = 0.08,
+    last_extension: float = 0.5,
+) -> List[Dict[str, Any]]:
+    """Fill short visual gaps without allowing subtitle overlap."""
+    optimized = [dict(segment) for segment in segments]
+    for index in range(len(optimized) - 1):
+        current = optimized[index]
+        next_segment = optimized[index + 1]
+        gap = float(next_segment["start"]) - float(current["end"])
+        extension = min(max_extension, gap - subtitle_gap)
+        if extension > 0:
+            current["end"] = float(current["end"]) + extension
+    if optimized and last_extension > 0:
+        optimized[-1]["end"] = float(optimized[-1]["end"]) + last_extension
+    return optimized
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="音频-文本对齐工具，生成SRT字幕文件"
+def align_audio_text(
+    audio_path: str,
+    text: str,
+    model_name: str = "small",
+    use_gpu: Optional[bool] = None,
+    max_chars: int = 30,
+    language: Optional[str] = "zh",
+    device: str = "auto",
+    progress_callback: Optional[ProgressCallback] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Align transcript text to audio while preserving the user's exact wording."""
+    validate_inputs(audio_path, text, max_chars)
+    if use_gpu is False and device == "auto":
+        device = "cpu"
+
+    recognized_segments, runtime_meta = transcribe_audio(
+        audio_path,
+        model_name=model_name,
+        language=language,
+        device=device,
+        progress_callback=progress_callback,
+    )
+    _notify(progress_callback, 0.58, "切分字幕文本")
+    user_sentences = split_text_into_segments(text, int(max_chars))
+    _notify(progress_callback, 0.68, f"文稿切分为 {len(user_sentences)} 条字幕")
+
+    report: Dict[str, Any] = {}
+    _notify(progress_callback, 0.74, "对齐文稿与语音时间轴")
+    aligned = match_user_text_to_timestamps(
+        recognized_segments, user_sentences, diagnostics=report
+    )
+    _notify(progress_callback, 0.9, "修正字幕重叠与显示间隔")
+    aligned = fix_overlapping_timestamps(aligned)
+    aligned = optimize_subtitle_duration(aligned)
+    if not aligned:
+        raise Txt2SrtError("未能生成有效字幕段落")
+
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(runtime_meta)
+        diagnostics.update(report)
+        diagnostics["segment_count"] = len(aligned)
+    _notify(progress_callback, 1.0, f"完成：生成 {len(aligned)} 条字幕")
+    return aligned
+
+
+def generate_srt_content(segments: Sequence[Dict[str, Any]]) -> str:
+    """Render standard SRT content without touching the filesystem."""
+    lines: List[str] = []
+    for index, segment in enumerate(segments, 1):
+        lines.extend(
+            (
+                str(index),
+                f"{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}",
+                str(segment.get("text", "")).strip(),
+                "",
+            )
+        )
+    return "\n".join(lines)
+
+
+def generate_srt(segments: Sequence[Dict[str, Any]], output_path: str) -> str:
+    """Write aligned segments to an SRT file and return its absolute path."""
+    if not segments:
+        raise InputValidationError("字幕段落为空，不会写入空 SRT 文件")
+    target = Path(output_path).expanduser().resolve()
+    if not target.parent.is_dir():
+        raise InputValidationError(f"输出目录不存在: {target.parent}")
+    target.write_text(generate_srt_content(segments), encoding="utf-8", newline="\n")
+    print(f"SRT 字幕已保存: {target}")
+    return str(target)
+
+
+def generate_srt_from_audio(
+    audio_path: str,
+    text: str,
+    output_path: Optional[str] = None,
+    model_name: str = "small",
+    language: Optional[str] = "zh",
+    max_chars: int = 30,
+    device: str = "auto",
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Any]:
+    """Unified service entry point inspired by the reference project."""
+    target = output_path or str(Path(audio_path).with_suffix(".srt"))
+    diagnostics: Dict[str, Any] = {}
+    segments = align_audio_text(
+        audio_path,
+        text,
+        model_name=model_name,
+        max_chars=max_chars,
+        language=language,
+        device=device,
+        progress_callback=progress_callback,
+        diagnostics=diagnostics,
+    )
+    srt_path = generate_srt(segments, target)
+    return {
+        "srt_path": srt_path,
+        "segments": segments,
+        "meta": {key: value for key, value in diagnostics.items() if key != "warnings"},
+        "warnings": diagnostics.get("warnings", []),
+    }
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="将音频与准确文稿对齐并生成 SRT 字幕")
+    parser.add_argument("audio", help="输入音频文件路径")
+    parser.add_argument("text", help="文本文件路径或直接文本内容")
+    parser.add_argument("-o", "--output", help="输出 SRT 路径，默认与音频同名")
+    parser.add_argument(
+        "-m", "--model", default="small", choices=SUPPORTED_MODELS, help="Whisper 模型"
     )
     parser.add_argument(
-        "audio",
-        help="输入音频文件路径 (支持 mp3, wav, m4a, flac, ogg 等格式)"
+        "-l", "--language", default="zh", help="语言代码；使用 auto 自动检测"
     )
     parser.add_argument(
-        "text",
-        help="输入文本文件路径 或 直接输入文本内容"
+        "-c", "--max-chars", type=int, default=30, help="每条字幕最大字数"
     )
     parser.add_argument(
-        "-o", "--output",
-        help="输出SRT文件路径 (默认: audio_name.srt)",
-        default=None
+        "--device", default="auto", choices=SUPPORTED_DEVICES, help="运行设备"
     )
-    parser.add_argument(
-        "-m", "--model",
-        help="Whisper模型大小 (tiny, base, small, medium, large)",
-        default="base",
-        choices=["tiny", "base", "small", "medium", "large"]
-    )
-    parser.add_argument(
-        "-l", "--language",
-        help="语言代码 (zh: 中文, en: 英文, None: 自动检测)",
-        default="zh"
-    )
-    
-    args = parser.parse_args()
-    
-    # 检查音频文件是否存在
-    if not os.path.exists(args.audio):
-        print(f"错误: 音频文件不存在: {args.audio}")
-        sys.exit(1)
-    
-    # 读取文本
-    if os.path.exists(args.text):
-        with open(args.text, 'r', encoding='utf-8') as f:
-            text_content = f.read()
-        print(f"从文件读取文本: {args.text}")
-    else:
-        text_content = args.text
-        print("使用直接提供的文本内容")
-    
-    # 设置输出文件路径
-    if args.output is None:
-        base_name = os.path.splitext(args.audio)[0]
-        output_path = f"{base_name}.srt"
-    else:
-        output_path = args.output
-    
-    # 执行对齐
-    print("\n开始音频-文本对齐...")
-    segments = align_audio_text(args.audio, text_content, args.model)
-    
-    # 生成SRT文件
-    generate_srt(segments, output_path)
-    
-    print(f"\n✅ 完成！共生成 {len(segments)} 个字幕段落")
+    return parser
+
+
+def _configure_windows_console() -> None:
+    """Keep CLI status and error messages readable in legacy Windows terminals."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    _configure_windows_console()
+    args = build_argument_parser().parse_args(argv)
+    try:
+        text_content = (
+            read_text_file(args.text) if Path(args.text).is_file() else args.text
+        )
+
+        def print_progress(progress: float, message: str) -> None:
+            print(f"[{progress:>5.0%}] {message}")
+
+        result = generate_srt_from_audio(
+            args.audio,
+            text_content,
+            output_path=args.output,
+            model_name=args.model,
+            language=args.language,
+            max_chars=args.max_chars,
+            device=args.device,
+            progress_callback=print_progress,
+        )
+        print(f"完成：{result['srt_path']}")
+        for warning in result["warnings"]:
+            print(f"警告：{warning}")
+        return 0
+    except Txt2SrtError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
-
-
-
-def fix_overlapping_timestamps(segments: List[Dict]) -> List[Dict]:
-    """
-    修复重叠的时间戳，确保字幕段落严格按时间顺序排列且不重叠
-    
-    Args:
-        segments: 初始对齐的段落列表（可能有重叠）
-    
-    Returns:
-        修复后的段落列表（无重叠）
-    """
-    if len(segments) == 0:
-        return segments
-    
-    # 按开始时间排序
-    segments = sorted(segments, key=lambda x: x["start"])
-    
-    fixed_segments = []
-    duration_fixed = 0  # 记录修复了多少个超长时长
-    
-    for i, segment in enumerate(segments):
-        start = segment["start"]
-        end = segment["end"]
-        text = segment["text"]
-        
-        # 计算文本的有效字符数（用于估算合理时长）
-        text_chars = len([c for c in text if c.strip() and c not in '。，！？；：、,.!?;: 　「」『』""''（）()【】[]'])
-        
-        # 计算合理的最大时长（每个字最多0.25秒，加上1秒基础时间）
-        # 中文语速约3-4字/秒，0.25秒/字已经是较慢的语速
-        max_duration = max(3.0, 1.0 + text_chars * 0.25)
-        
-        # 计算合理的最小时长（每个字至少0.15秒，加上0.5秒基础时间）
-        min_duration = max(1.0, 0.5 + text_chars * 0.15)
-        
-        # 如果不是第一个段落，检查与前一个字幕的关系
-        if i > 0:
-            prev_end = fixed_segments[-1]["end"]
-            
-            # 仅处理重叠，不在此处做大范围的空隙填补
-            if start < prev_end:
-                # 重叠了，调整开始时间为上一个段落结束时间
-                start = prev_end
-        
-        # 检查时长是否合理
-        duration = end - start
-        
-        # 修复超长时长（防止"吞字"问题）
-        if duration > max_duration:
-            end = start + max_duration
-            duration_fixed += 1
-        
-        # 修复过短时长
-        if duration < min_duration:
-            end = start + min_duration
-        
-        # 确保结束时间晚于开始时间
-        if end <= start:
-            # 此时start可能被推迟了，end保持原样可能导致end<=start
-            # 强制给一个最短持续时间
-            estimated_duration = max(1.0, text_chars * 0.15)
-            end = start + estimated_duration
-        
-        # 再次检查是否与下一个字幕冲突（确保基础的无重叠）
-        if i + 1 < len(segments):
-            next_start = segments[i + 1]["start"]
-            if end > next_start:
-                # 缩短到下一个字幕开始前（严格不重叠）
-                end = next_start
-        
-        # 最终安全检查：如果修正后end还是<=start，强制0.5秒
-        if end <= start:
-             end = start + 0.5 
-
-        fixed_segments.append({
-            "start": start,
-            "end": end,
-            "text": text
-        })
-    
-    if duration_fixed > 0:
-        print(f"   (基础修正) 修复了 {duration_fixed} 处超长时长")
-    
-    return fixed_segments
-
-
-def optimize_subtitle_duration(segments: List[Dict], max_extension: float = 0.5) -> List[Dict]:
-    """
-    优化字幕持续时间：填补句间空隙，提升观感
-    args:
-        segments: 包含 {"start": float, "end": float, "text": str} 的列表
-        max_extension: 最大自动延长时间（秒），建议 0.5
-    """
-    if not segments:
-        return segments
-
-    # 遍历（除了最后一句）
-    for i in range(len(segments) - 1):
-        curr_seg = segments[i]
-        next_seg = segments[i+1]
-        
-        # 计算两句之间的空隙
-        gap = next_seg["start"] - curr_seg["end"]
-        
-        if gap > 0:
-            # 策略：填补空隙，但保留 0.1s 间隔，且不超过最大延长阈值
-            extend_by = min(max_extension, gap - 0.1)
-            
-            # 只有当确实能延长时才操作 (extend_by可能为负，如果gap<0.1)
-            if extend_by > 0:
-                curr_seg["end"] += extend_by
-                
-    # 特殊处理最后一句：总是延长 0.5s，防止结束太快
-    if segments:
-        segments[-1]["end"] += 0.5
-    
-    return segments
+    raise SystemExit(main())
